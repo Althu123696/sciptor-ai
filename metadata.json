@@ -1,6 +1,6 @@
 {
   "name": "Scriptor AI",
-  "description": "A premium, sophisticated AI-powered transcription and speaker diarization platform.",
-  "requestFramePermissions": ["microphone"],
+  "description": "A premium, sophisticated AI-powered audio transcription platform.",
+  "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

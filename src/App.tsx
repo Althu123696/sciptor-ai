@@ -6,6 +6,7 @@ import {
   Play, 
   Pause, 
   RotateCcw, 
+  RotateCw,
   Volume2, 
   VolumeX, 
   Globe, 
@@ -28,6 +29,7 @@ import {
   ListTodo, 
   FileJson, 
   FileText,
+  PenTool,
   Volume1,
   MessageSquare,
   Send,
@@ -132,6 +134,7 @@ export default function App() {
   const [recordingSeconds, setRecordingSeconds] = useState<number>(0);
   const [recordedAudioUrl, setRecordedAudioUrl] = useState<string | null>(null);
   const [recordedBase64, setRecordedBase64] = useState<string | null>(null);
+  const [isMicMonitorEnabled, setIsMicMonitorEnabled] = useState<boolean>(true);
 
   // Settings
   const [language, setLanguage] = useState<string>('English');
@@ -148,13 +151,23 @@ export default function App() {
   const [transcriptionProgress, setTranscriptionProgress] = useState<number>(0);
   const [isAiProcessing, setIsAiProcessing] = useState<boolean>(false);
   const [aiActionResult, setAiActionResult] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'summary' | 'actions' | 'translate' | 'chat'>('summary');
+  const [activeTab, setActiveTab] = useState<'summary' | 'actions' | 'translate' | 'writer' | 'chat'>('summary');
+
+  // Scriptor Co-Writer and Adaptive Recording states
+  const [creativeType, setCreativeType] = useState<string>('Story');
+  const [creativePrompt, setCreativePrompt] = useState<string>('');
+  const [useTranscriptForCreative, setUseTranscriptForCreative] = useState<boolean>(true);
+  const [creativeResult, setCreativeResult] = useState<string | null>(null);
+  const [isGeneratingCreative, setIsGeneratingCreative] = useState<boolean>(false);
+  const [recordedMimeType, setRecordedMimeType] = useState<string>('audio/webm');
 
   // Editing segments states
   const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState<string>('');
   const [editingSpeakerId, setEditingSpeakerId] = useState<string | null>(null);
   const [editingSpeakerName, setEditingSpeakerName] = useState<string>('');
+  const [isEditingFullText, setIsEditingFullText] = useState<boolean>(false);
+  const [fullTextDraft, setFullTextDraft] = useState<string>('');
 
   // Chat State
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
@@ -198,6 +211,8 @@ export default function App() {
   const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const mockPlaybackIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
 
   // --- Auth, Feedback & Admin Helpers ---
   const fetchAdminDashboard = async (email: string) => {
@@ -400,6 +415,10 @@ export default function App() {
 
   const activeTranscript = savedTranscriptions.find(t => t.id === activeId) || null;
 
+  const timelineItems = React.useMemo(() => {
+    return activeTranscript ? getTimelineItems(activeTranscript.segments, activeTranscript.duration) : [];
+  }, [activeTranscript]);
+
   // Synchronize HTML5 audio element properties with React state
   useEffect(() => {
     if (audioElRef.current) {
@@ -450,12 +469,7 @@ export default function App() {
   // Set initial duration when active transcript changes and load session audio URL if present
   useEffect(() => {
     if (activeTranscript) {
-      const parts = activeTranscript.duration.split(':');
-      if (parts.length === 2) {
-        const mins = parseInt(parts[0], 10);
-        const secs = parseInt(parts[1], 10);
-        setDuration(mins * 60 + secs);
-      }
+      setDuration(parseTimestampToSeconds(activeTranscript.duration));
       setCurrentTime(0);
       setIsPlaying(false);
       setAiActionResult(null);
@@ -536,6 +550,46 @@ export default function App() {
     }
   };
 
+  // Web Audio Context for microphone loopback / monitor
+  const startMicMonitor = async (stream: MediaStream) => {
+    try {
+      if (audioContextRef.current) {
+        try {
+          await audioContextRef.current.close();
+        } catch (e) {
+          // ignore
+        }
+      }
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioContextClass) {
+        const audioCtx = new AudioContextClass();
+        audioContextRef.current = audioCtx;
+        const source = audioCtx.createMediaStreamSource(stream);
+        audioSourceRef.current = source;
+        source.connect(audioCtx.destination);
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume();
+        }
+        console.log("Mic monitor loopback started successfully");
+      }
+    } catch (e) {
+      console.error("Failed to start mic monitor:", e);
+    }
+  };
+
+  const stopMicMonitor = () => {
+    try {
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
+      audioSourceRef.current = null;
+      console.log("Mic monitor loopback stopped");
+    } catch (e) {
+      console.error("Failed to stop mic monitor:", e);
+    }
+  };
+
   // Start microphone capture
   const handleStartRecording = async () => {
     audioChunksRef.current = [];
@@ -544,8 +598,29 @@ export default function App() {
     setRecordingSeconds(0);
 
     try {
+      let options: MediaRecorderOptions = {};
+      let preferredMimeType = '';
+      
+      if (typeof MediaRecorder.isTypeSupported === 'function') {
+        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+          preferredMimeType = 'audio/webm;codecs=opus';
+        } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+          preferredMimeType = 'audio/webm';
+        } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+          preferredMimeType = 'audio/ogg;codecs=opus';
+        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+          preferredMimeType = 'audio/mp4';
+        } else if (MediaRecorder.isTypeSupported('audio/aac')) {
+          preferredMimeType = 'audio/aac';
+        }
+      }
+      
+      if (preferredMimeType) {
+        options.mimeType = preferredMimeType;
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
+      const mediaRecorder = new MediaRecorder(stream, options);
       mediaRecorderRef.current = mediaRecorder;
 
       mediaRecorder.ondataavailable = (event) => {
@@ -555,7 +630,10 @@ export default function App() {
       };
 
       mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+        const actualMimeType = mediaRecorder.mimeType || preferredMimeType || 'audio/wav';
+        setRecordedMimeType(actualMimeType);
+
+        const audioBlob = new Blob(audioChunksRef.current, { type: actualMimeType });
         const audioUrl = URL.createObjectURL(audioBlob);
         setRecordedAudioUrl(audioUrl);
 
@@ -572,7 +650,11 @@ export default function App() {
         stream.getTracks().forEach(track => track.stop());
       };
 
-      mediaRecorder.start();
+      if (isMicMonitorEnabled) {
+        await startMicMonitor(stream);
+      }
+
+      mediaRecorder.start(250); // Record in 250ms chunks for reliability
       setIsRecording(true);
 
       recordingTimerRef.current = setInterval(() => {
@@ -582,6 +664,7 @@ export default function App() {
       showToast('Recording started...', 'info');
     } catch (err: any) {
       console.error(err);
+      stopMicMonitor();
       showToast('Could not access microphone. Ensure permissions are granted.', 'error');
     }
   };
@@ -594,6 +677,7 @@ export default function App() {
       if (recordingTimerRef.current) {
         clearInterval(recordingTimerRef.current);
       }
+      stopMicMonitor();
       showToast('Recording saved locally', 'success');
     }
   };
@@ -604,7 +688,21 @@ export default function App() {
       return;
     }
     const durationFormatted = formatTime(recordingSeconds);
-    await handleUploadTranscription(recordedBase64, 'Live Recording Audio.wav', 'audio/wav', durationFormatted, recordingSeconds, recordedAudioUrl);
+    
+    let ext = 'webm';
+    if (recordedMimeType.includes('mp4')) ext = 'mp4';
+    else if (recordedMimeType.includes('ogg')) ext = 'ogg';
+    else if (recordedMimeType.includes('wav')) ext = 'wav';
+    else if (recordedMimeType.includes('aac')) ext = 'aac';
+
+    await handleUploadTranscription(
+      recordedBase64, 
+      `Live Voice Capture.${ext}`, 
+      recordedMimeType, 
+      durationFormatted, 
+      recordingSeconds, 
+      recordedAudioUrl
+    );
   };
 
   // Send audio file payload to /api/transcribe
@@ -700,7 +798,7 @@ export default function App() {
 
   const handleDeleteTranscription = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (confirm('Permanently delete this transcription record from your vault?')) {
+    if (confirm('Permanently delete this transcription record?')) {
       const updated = savedTranscriptions.filter(t => t.id !== id);
       saveTranscriptions(updated);
       if (activeId === id) {
@@ -749,7 +847,71 @@ export default function App() {
     }
   };
 
+  const handleCreateCreative = async () => {
+    setIsGeneratingCreative(true);
+    setCreativeResult(null);
+    showToast(`Scriptor AI Co-Writer drafting masterpiece...`, 'info');
+
+    try {
+      const response = await fetch('/api/ai-action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          segments: useTranscriptForCreative && activeTranscript ? activeTranscript.segments : [],
+          task: 'creative-writing',
+          options: {
+            creativeType,
+            customPrompt: creativePrompt,
+            useTranscriptContext: useTranscriptForCreative && !!activeTranscript
+          }
+        })
+      });
+
+      const data = await response.json();
+      if (response.ok && data.result) {
+        setCreativeResult(data.result);
+        showToast('Creative writing draft ready!', 'success');
+      } else {
+        showToast(data.error || 'AI writer failed.', 'error');
+      }
+    } catch (e) {
+      console.error(e);
+      showToast('Could not reach Scriptor AI server api.', 'error');
+    } finally {
+      setIsGeneratingCreative(false);
+    }
+  };
+
   // Inline transcription text correction
+  const handleStartEditingFullText = () => {
+    if (!activeTranscript) return;
+    const combined = activeTranscript.segments.map(s => s.text).join('\n\n');
+    setFullTextDraft(combined);
+    setIsEditingFullText(true);
+  };
+
+  const handleSaveFullText = () => {
+    if (!activeTranscript) return;
+    const paragraphs = fullTextDraft.split(/\n\n+/).filter(p => p.trim());
+    const newSegments = paragraphs.map((p, index) => ({
+      id: `seg-${Date.now()}-${index}`,
+      timestamp: index === 0 ? '00:00' : formatTime(index * 15),
+      speaker: 'Speaker',
+      text: p.trim()
+    }));
+
+    const updatedTrans = savedTranscriptions.map(t => {
+      if (t.id === activeId) {
+        return { ...t, segments: newSegments };
+      }
+      return t;
+    });
+
+    saveTranscriptions(updatedTrans);
+    setIsEditingFullText(false);
+    showToast('Transcription draft updated', 'success');
+  };
+
   const handleStartEditingSegment = (id: string, currentText: string) => {
     setEditingSegmentId(id);
     setEditingText(currentText);
@@ -925,9 +1087,17 @@ export default function App() {
   };
 
   const formatTime = (totalSeconds: number): string => {
-    const mins = Math.floor(totalSeconds / 60);
-    const secs = totalSeconds % 60;
+    const hrs = Math.floor(totalSeconds / 3600);
+    const mins = Math.floor((totalSeconds % 3600) / 60);
+    const secs = Math.floor(totalSeconds % 60);
+    if (hrs > 0) {
+      return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const handlePlayPause = () => {
+    setIsPlaying(prev => !prev);
   };
 
   const filteredTranscripts = savedTranscriptions.filter(t => 
@@ -1119,7 +1289,7 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen bg-[#0A0A0A] text-slate-300 font-sans overflow-hidden">
+    <div className="min-h-screen bg-[#070707] text-slate-300 font-sans flex flex-col overflow-y-auto">
       
       {/* 🔔 PREMIUM ATMOSPHERIC TOAST NOTIFICATION */}
       {toast && (
@@ -1134,1081 +1304,1162 @@ export default function App() {
         </div>
       )}
 
-      {/* 🗃️ LEFT SIDEBAR: Transcription Hub, Live Recording & History Vault */}
-      <div id="left-sidebar" className={`flex flex-col bg-[#0F0F0F] border-r border-white/5 h-full transition-all duration-300 z-20 ${
-        isLeftSidebarOpen ? 'w-80' : 'w-0 overflow-hidden'
-      }`}>
-        {/* Sidebar Brand Logo */}
-        <div className="h-20 border-b border-white/5 flex items-center justify-between px-6 bg-[#0F0F0F]">
-          <div className="flex items-center gap-3">
-            <div className="w-7 h-7 bg-amber-500 rounded flex items-center justify-center text-black font-serif font-bold text-sm shadow-lg shadow-amber-500/10">S</div>
-            <div>
-              <span className="text-sm font-serif tracking-[0.25em] text-white uppercase block leading-none">Scriptor AI</span>
-              <span className="text-[8px] font-mono tracking-widest text-slate-500 uppercase mt-1 block">Diarization v1.2</span>
-            </div>
-          </div>
-          <button 
-            id="close-sidebar-btn"
-            onClick={() => setIsLeftSidebarOpen(false)}
-            className="p-1.5 rounded hover:bg-white/5 text-slate-500 hover:text-white transition-colors"
-            title="Collapse Sidebar"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        {/* Navigation Selector */}
-        <div className="flex border-b border-white/5 bg-[#0B0B0B] p-1 gap-1 shrink-0">
-          <button
-            onClick={() => setActiveMainView('workspace')}
-            className={`flex-1 py-2 text-[9px] uppercase tracking-wider font-bold rounded transition-all cursor-pointer ${
-              activeMainView === 'workspace' ? 'bg-[#151515] text-amber-500 border border-white/5' : 'text-slate-500 hover:text-slate-300'
-            }`}
-          >
-            Workspace
-          </button>
-          <button
-            onClick={() => setActiveMainView('feedback')}
-            className={`flex-1 py-2 text-[9px] uppercase tracking-wider font-bold rounded transition-all cursor-pointer ${
-              activeMainView === 'feedback' ? 'bg-[#151515] text-amber-500 border border-white/5' : 'text-slate-500 hover:text-slate-300'
-            }`}
-          >
-            Enquiry
-          </button>
-          <button
-            onClick={() => setActiveMainView('privacy')}
-            className={`flex-1 py-2 text-[9px] uppercase tracking-wider font-bold rounded transition-all cursor-pointer ${
-              activeMainView === 'privacy' ? 'bg-[#151515] text-amber-500 border border-white/5' : 'text-slate-500 hover:text-slate-300'
-            }`}
-          >
-            Privacy
-          </button>
-          {currentUser?.role === 'admin' && (
-            <button
-              onClick={() => { setActiveMainView('admin'); fetchAdminDashboard(currentUser.email); }}
-              className={`flex-1 py-2 text-[9px] uppercase tracking-wider font-bold rounded transition-all cursor-pointer ${
-                activeMainView === 'admin' ? 'bg-amber-500 text-black font-extrabold shadow-md shadow-amber-500/20' : 'text-amber-400 hover:text-amber-300 bg-amber-500/5 hover:bg-amber-500/10'
-              }`}
-            >
-              Admin
-            </button>
-          )}
-        </div>
-
-        {/* Live Audio Source Configuration panel */}
-        <div className="p-5 border-b border-white/5 bg-[#0A0A0A]/30">
-          <div className="text-[9px] text-slate-500 uppercase font-bold tracking-[0.2em] mb-3.5 flex items-center gap-1.5">
-            <Mic className="w-3 h-3 text-amber-500" />
-            <span>Transcription Input</span>
-          </div>
-
-          {/* Upload Audio File area */}
-          <div 
-            id="drop-zone"
-            onDragOver={handleDragOver}
-            onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
-            className="border border-dashed border-white/10 hover:border-amber-500/30 rounded-lg p-4 text-center cursor-pointer bg-[#121212]/50 hover:bg-[#121212] transition-all group mb-4"
-          >
-            <Upload className="w-6 h-6 mx-auto text-slate-500 group-hover:text-amber-500 mb-2 transition-colors" />
-            <div className="text-xs text-slate-300 font-medium">Upload Audio File</div>
-            <div className="text-[10px] text-slate-600 mt-1 font-mono">WAV, MP3, M4A up to 50MB</div>
-            <input 
-              ref={fileInputRef}
-              type="file" 
-              accept="audio/*" 
-              className="hidden" 
-              onChange={handleFileChange} 
-            />
-          </div>
-
-          {/* Micro Recording Action */}
-          <div className="bg-[#121212] border border-white/5 rounded-lg p-3.5">
-            <div className="flex items-center justify-between mb-3">
-              <span className="text-[10px] text-slate-400 font-mono uppercase tracking-wider">Live Voice Capture</span>
-              {isRecording && (
-                <span className="text-[9px] text-red-400 font-mono animate-pulse uppercase tracking-widest flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-red-500"></span>
-                  <span>Rec: {formatTime(recordingSeconds)}</span>
-                </span>
-              )}
-            </div>
-
-            {!isRecording ? (
-              <button
-                id="mic-start-btn"
-                onClick={handleStartRecording}
-                className="w-full py-2 bg-red-950/40 hover:bg-red-900/40 border border-red-500/20 text-red-400 font-sans font-bold text-[10px] uppercase tracking-widest rounded flex items-center justify-center gap-2 transition-all"
-              >
-                <Mic className="w-3.5 h-3.5" />
-                <span>Start Microphone</span>
-              </button>
-            ) : (
-              <button
-                id="mic-stop-btn"
-                onClick={handleStopRecording}
-                className="w-full py-2 bg-amber-500 text-black font-sans font-bold text-[10px] uppercase tracking-widest rounded flex items-center justify-center gap-2 transition-all shadow-lg animate-pulse"
-              >
-                <Square className="w-3.5 h-3.5 fill-current" />
-                <span>Stop Recording</span>
-              </button>
-            )}
-
-            {recordedAudioUrl && !isRecording && (
-              <div className="mt-3.5 pt-3 border-t border-white/5">
-                <div className="text-[10px] text-slate-500 font-mono mb-2">Recorded Speech Cache:</div>
-                <audio src={recordedAudioUrl} controls className="w-full h-8 rounded bg-[#181818] outline-none" />
-                <button
-                  id="transcribe-rec-btn"
-                  onClick={handleTranscribeRecordedAudio}
-                  className="w-full mt-2.5 py-2 bg-amber-500 hover:bg-amber-400 text-black font-sans font-bold text-[10px] uppercase tracking-widest rounded flex items-center justify-center gap-1.5 transition-all shadow-md"
-                >
-                  <Sparkles className="w-3.5 h-3.5 text-black" />
-                  <span>Transcribe Captured Voice</span>
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* Engine Parameters Toggle */}
-          <div className="mt-4 pt-3.5 border-t border-white/5 space-y-3">
-            <div className="flex items-center justify-between">
-              <label className="text-[9px] text-slate-500 font-mono uppercase tracking-widest">Detect Speakers</label>
-              <input 
-                type="number" 
-                min={1} 
-                max={6}
-                value={speakerCount} 
-                onChange={(e) => setSpeakerCount(Math.max(1, Math.min(6, parseInt(e.target.value) || 2)))}
-                className="w-12 text-center bg-[#151515] text-amber-400 text-[10px] font-mono border border-white/5 rounded py-0.5"
-              />
-            </div>
-            <div className="flex items-center justify-between">
-              <label className="text-[9px] text-slate-500 font-mono uppercase tracking-widest">Target Language</label>
-              <select 
-                value={language}
-                onChange={(e) => setLanguage(e.target.value)}
-                className="bg-[#151515] text-slate-300 text-[10px] font-mono border border-white/5 rounded py-0.5 px-2 focus:outline-none"
-              >
-                <option value="Auto">Detect Automatically</option>
-                <option value="English">English</option>
-                <option value="Spanish">Spanish</option>
-                <option value="Japanese">Japanese</option>
-                <option value="Indonesian">Indonesian</option>
-                <option value="German">German</option>
-                <option value="French">French</option>
-              </select>
-            </div>
-          </div>
-        </div>
-
-        {/* Transcription Search */}
-        <div className="px-5 py-3">
-          <input
-            id="search-docs-input"
-            type="text"
-            placeholder="Search transcript archives..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-[#151515] border border-white/5 rounded py-2 px-3.5 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-amber-500/50 transition-colors"
-          />
-        </div>
-
-        {/* History Archives Collection */}
-        <div className="flex-1 flex flex-col min-h-0">
-          <div className="px-5 text-[9px] text-slate-500 uppercase font-bold tracking-[0.2em] mb-2.5 flex items-center gap-1.5">
-            <History className="w-3 h-3 text-amber-500/60" />
-            <span>Vault Archives ({filteredTranscripts.length})</span>
-          </div>
-          
-          <div className="flex-1 overflow-y-auto px-3 pb-5 space-y-1.5">
-            {filteredTranscripts.length === 0 ? (
-              <div className="p-6 text-center text-slate-600 text-xs italic">
-                No matching transcripts inside vault.
-              </div>
-            ) : (
-              filteredTranscripts.map(trans => (
-                <div
-                  key={trans.id}
-                  id={`archive-item-${trans.id}`}
-                  onClick={() => setActiveId(trans.id)}
-                  className={`group flex items-center justify-between p-3 rounded transition-all duration-200 cursor-pointer ${
-                    trans.id === activeId 
-                      ? 'bg-[#151515] text-white border-l-2 border-amber-500 border border-y-white/5 border-r-white/5' 
-                      : 'text-slate-400 hover:bg-[#151515]/50 hover:text-slate-200 border border-transparent'
-                  }`}
-                >
-                  <div className="flex flex-col min-w-0 flex-1 pr-2">
-                    <span className={`text-xs font-serif truncate ${trans.id === activeId ? 'text-white font-medium' : 'text-slate-300 group-hover:text-white'}`}>
-                      {trans.title}
-                    </span>
-                    <div className="flex items-center gap-2 mt-1.5 text-[9px] text-slate-600 font-mono">
-                      <span>{trans.duration}</span>
-                      <span className="w-1 h-1 rounded-full bg-white/10"></span>
-                      <span className="uppercase text-[8px] text-amber-500/80">{trans.language}</span>
-                    </div>
-                  </div>
-                  <button
-                    id={`delete-trans-btn-${trans.id}`}
-                    onClick={(e) => handleDeleteTranscription(trans.id, e)}
-                    className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-white/10 hover:text-red-400 transition-all text-slate-600"
-                    title="Delete Record"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-
-        {/* Active User Session & Limits display */}
-        <div className="p-5 border-t border-white/5 bg-[#0C0C0C] space-y-3.5 shrink-0">
-          <div className="flex items-center justify-between gap-2 border-b border-white/5 pb-2.5">
-            <div className="min-w-0">
-              <span className="text-[10px] text-slate-500 font-mono uppercase block">Active Session</span>
-              <span className="text-xs font-semibold text-white truncate block">{currentUser?.email}</span>
-              <span className="text-[8px] font-mono uppercase tracking-wider text-amber-500 mt-0.5 block">
-                {currentUser?.role === 'admin' ? '🛡️ Scriptor Owner' : '👥 Authorized Client'}
-              </span>
-            </div>
-            <button
-              onClick={handleSignOut}
-              className="px-2.5 py-1.5 bg-[#1C1C1C] hover:bg-red-950/20 hover:text-red-400 border border-white/5 hover:border-red-500/20 rounded text-[9px] font-mono uppercase tracking-wider transition-all cursor-pointer flex items-center gap-1.5 shrink-0"
-              title="Sign Out"
-            >
-              <LogOut className="w-3 h-3" />
-              <span>Out</span>
-            </button>
-          </div>
-
+      {/* 🌐 PROFESSIONAL STICKY NAVIGATION HEADER */}
+      <header className="sticky top-0 z-40 bg-[#0F0F0F]/95 backdrop-blur-md border-b border-white/5 px-6 md:px-12 py-4 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-xl shrink-0">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 bg-amber-500 rounded flex items-center justify-center text-black font-serif font-bold text-base shadow-lg shadow-amber-500/10">S</div>
           <div>
-            <div className="flex justify-between text-[9px] font-mono text-slate-500 uppercase tracking-widest mb-1.5">
-              <span>Monthly Allowance Used</span>
-              <span>
-                {currentUser?.role === 'admin' 
-                  ? 'Unlimited Time' 
-                  : `${Math.floor((currentUser?.usedSeconds || 0) / 60)}m ${Math.round((currentUser?.usedSeconds || 0) % 60)}s / ${Math.round(monthlyLimitSeconds / 60)}m`
-                }
-              </span>
-            </div>
-            {currentUser?.role !== 'admin' && (
-              <div className="w-full bg-[#181818] h-1.5 rounded-full overflow-hidden">
-                <div 
-                  className="bg-amber-500 h-full rounded-full transition-all duration-500"
-                  style={{ width: `${Math.min(100, ((currentUser?.usedSeconds || 0) / monthlyLimitSeconds) * 100)}%` }}
-                ></div>
-              </div>
-            )}
-            <span className="text-[8px] text-slate-600 font-mono mt-1.5 block">
+            <span className="text-sm md:text-base font-serif tracking-[0.25em] text-white uppercase block leading-none">Scriptor AI</span>
+            <span className="text-[9px] font-mono tracking-widest text-slate-500 uppercase mt-1 block">Unified Speaker Diarization Station</span>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-center sm:justify-end gap-3 md:gap-5">
+          {/* Quick Stats Allowance display */}
+          <div className="text-right hidden md:block">
+            <span className="text-[9px] font-mono text-slate-500 uppercase tracking-widest block">Monthly Usage Allowance</span>
+            <span className="text-xs font-mono text-amber-400 font-semibold">
               {currentUser?.role === 'admin' 
-                ? 'Owner has un-restricted development and execution cycles.' 
-                : 'Free tiers reset on a 30-day billing cycle.'
+                ? 'Unlimited Cycles' 
+                : `${Math.floor((currentUser?.usedSeconds || 0) / 60)}m ${Math.round((currentUser?.usedSeconds || 0) % 60)}s / ${Math.round(monthlyLimitSeconds / 60)}m`
               }
             </span>
           </div>
-        </div>
-      </div>
 
-      {/* 🖥️ MIDDLE WORKSPACE: Active Transcript Viewer, Audio Player, Waveform, and Editor */}
-      <div className="flex-1 flex flex-col h-full overflow-hidden">
-        
-        {/* Workspace Action Toolbar */}
-        <div className="h-20 bg-[#0F0F0F] border-b border-white/5 px-6 flex items-center justify-between gap-4 z-10">
-          <div className="flex items-center gap-4">
-            {!isLeftSidebarOpen && (
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => { setActiveMainView('workspace'); window.scrollTo({ top: 0, behavior: 'smooth' }); }}
+              className={`px-3.5 py-2 text-[10px] uppercase tracking-wider font-bold rounded transition-all border ${
+                activeMainView === 'workspace' ? 'bg-[#151515] text-amber-500 border-white/10' : 'text-slate-400 border-transparent hover:text-white'
+              }`}
+            >
+              Workspace
+            </button>
+            <button
+              onClick={() => { setActiveMainView('feedback'); window.scrollTo({ top: 0, behavior: 'smooth' }); }}
+              className={`px-3.5 py-2 text-[10px] uppercase tracking-wider font-bold rounded transition-all border ${
+                activeMainView === 'feedback' ? 'bg-[#151515] text-amber-500 border-white/10' : 'text-slate-400 border-transparent hover:text-white'
+              }`}
+            >
+              Support Enquiry
+            </button>
+            <button
+              onClick={() => { setActiveMainView('privacy'); window.scrollTo({ top: 0, behavior: 'smooth' }); }}
+              className={`px-3.5 py-2 text-[10px] uppercase tracking-wider font-bold rounded transition-all border ${
+                activeMainView === 'privacy' ? 'bg-[#151515] text-amber-500 border-white/10' : 'text-slate-400 border-transparent hover:text-white'
+              }`}
+            >
+              Privacy Policy
+            </button>
+            {currentUser?.role === 'admin' && (
               <button
-                id="open-sidebar-btn"
-                onClick={() => setIsLeftSidebarOpen(true)}
-                className="p-2 bg-[#151515] border border-white/5 hover:border-white/10 text-slate-300 rounded transition-colors"
-                title="Expand Archives"
+                onClick={() => { setActiveMainView('admin'); fetchAdminDashboard(currentUser.email); window.scrollTo({ top: 0, behavior: 'smooth' }); }}
+                className={`px-3.5 py-2 text-[10px] uppercase tracking-wider font-extrabold rounded transition-all border ${
+                  activeMainView === 'admin' ? 'bg-amber-500 text-black border-transparent shadow-md shadow-amber-500/20' : 'text-amber-400 border-amber-500/20 bg-amber-500/5 hover:bg-amber-500/10'
+                }`}
               >
-                <Menu className="w-4 h-4" />
+                Owner Console
               </button>
             )}
-            {activeTranscript ? (
-              <div className="flex items-center gap-2">
-                <span className="text-xs bg-emerald-500/10 text-emerald-400 font-mono uppercase font-bold tracking-widest px-2 py-0.5 rounded border border-emerald-500/20">
-                  Ready
-                </span>
-                <h1 className="font-serif text-white text-sm md:text-base tracking-wide max-w-xs md:max-w-lg truncate">
-                  {activeTranscript.title}
-                </h1>
-              </div>
-            ) : (
-              <div className="font-serif text-slate-500 text-sm tracking-widest uppercase">Vault Empty</div>
-            )}
+            <button
+              onClick={handleSignOut}
+              className="px-3.5 py-2 bg-[#1C1C1C] hover:bg-red-950/20 hover:text-red-400 border border-white/5 hover:border-red-500/20 rounded text-[10px] font-mono uppercase tracking-wider transition-all flex items-center gap-1.5"
+              title="Sign Out"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Out</span>
+            </button>
           </div>
-
-          {activeTranscript && (
-            <div className="flex items-center gap-2">
-              <button
-                id="copy-text-btn"
-                onClick={handleCopyTranscriptText}
-                className="p-2 bg-[#151515] border border-white/5 hover:border-white/10 text-slate-400 hover:text-white rounded transition-all"
-                title="Copy Full Transcript"
-              >
-                <Copy className="w-3.5 h-3.5" />
-              </button>
-              
-              {/* Download dropdown */}
-              <div className="flex items-center bg-[#151515] rounded border border-white/5 p-0.5">
-                <button
-                  id="dl-txt-btn"
-                  onClick={() => handleDownloadTranscript('txt')}
-                  className="px-2.5 py-1 text-[9px] uppercase tracking-wider font-semibold text-slate-400 hover:text-white rounded"
-                  title="Download TXT"
-                >
-                  TXT
-                </button>
-                <button
-                  id="dl-srt-btn"
-                  onClick={() => handleDownloadTranscript('srt')}
-                  className="px-2.5 py-1 text-[9px] uppercase tracking-wider font-semibold text-slate-400 hover:text-white rounded border-l border-white/5"
-                  title="Download SRT Subtitle"
-                >
-                  SRT
-                </button>
-                <button
-                  id="dl-json-btn"
-                  onClick={() => handleDownloadTranscript('json')}
-                  className="px-2.5 py-1 text-[9px] uppercase tracking-wider font-semibold text-slate-400 hover:text-white rounded border-l border-white/5"
-                  title="Download JSON structure"
-                >
-                  JSON
-                </button>
-              </div>
-
-              {!isRightSidebarOpen && (
-                <button
-                  id="open-companion-btn"
-                  onClick={() => setIsRightSidebarOpen(true)}
-                  className="flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/20 hover:bg-amber-500/20 text-amber-400 text-[10px] uppercase tracking-wider font-bold py-2 px-3 rounded transition-all"
-                >
-                  <MessageSquare className="w-3.5 h-3.5" />
-                  <span>Assistant</span>
-                </button>
-              )}
-            </div>
-          )}
         </div>
+      </header>
 
-        {/* Active Workspace / Admin / Feedback / Privacy View Router */}
-        {activeMainView === 'admin' ? (
-          <div className="flex-1 overflow-y-auto p-6 md:p-8 bg-[#070707] space-y-6">
-            <div className="max-w-4xl mx-auto space-y-6">
-              {/* Dashboard summary cards */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div className="bg-[#0F0F0F] border border-white/5 rounded-lg p-5">
-                  <span className="text-[10px] text-slate-500 font-mono uppercase tracking-widest block">Authorized Signups</span>
-                  <span className="text-2xl font-serif text-white block mt-1.5">{adminData?.users?.length || 1}</span>
-                  <span className="text-[9px] text-slate-600 font-mono uppercase block mt-1">Live profiles in database</span>
-                </div>
-                <div className="bg-[#0F0F0F] border border-white/5 rounded-lg p-5">
-                  <span className="text-[10px] text-slate-500 font-mono uppercase tracking-widest block">Monthly Base Limit</span>
-                  <span className="text-2xl font-serif text-amber-500 block mt-1.5">{Math.round(monthlyLimitSeconds / 60)} Mins</span>
-                  <span className="text-[9px] text-slate-600 font-mono uppercase block mt-1">For general clients (1h 15m default)</span>
-                </div>
-                <div className="bg-[#0F0F0F] border border-white/5 rounded-lg p-5">
-                  <span className="text-[10px] text-slate-500 font-mono uppercase tracking-widest block">Enquiries & Feedbacks</span>
-                  <span className="text-2xl font-serif text-white block mt-1.5">{adminData?.feedbacks?.length || 0}</span>
-                  <span className="text-[9px] text-slate-600 font-mono uppercase block mt-1">Direct inquiries received</span>
-                </div>
-              </div>
+      {/* 🚀 MAIN WEBSITE CONTENT FLOWS DOWNWARDS */}
+      <main className="flex-1 w-full max-w-6xl mx-auto px-4 md:px-8 py-8 space-y-12">
 
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                {/* Monthly limit config */}
-                <div className="bg-[#0F0F0F] border border-white/5 rounded-lg p-5 lg:col-span-1 space-y-4">
-                  <div className="flex items-center gap-2 border-b border-white/5 pb-2">
-                    <Sliders className="w-4 h-4 text-amber-500" />
-                    <h3 className="text-xs font-serif text-white uppercase tracking-wider">Configure Limits</h3>
-                  </div>
-                  <p className="text-[10px] text-slate-500 leading-relaxed font-sans">
-                    As Scriptor's Owner, you can dynamically configure the transcription limit seconds granted to general clients.
-                  </p>
-                  <div className="space-y-2">
-                    <label className="text-[9px] text-slate-500 uppercase font-mono tracking-wider block">Default Limit (Minutes)</label>
-                    <div className="flex gap-2">
-                      <input
-                        type="number"
-                        value={Math.round(monthlyLimitSeconds / 60)}
-                        onChange={(e) => setMonthlyLimitSeconds((parseInt(e.target.value) || 0) * 60)}
-                        className="flex-1 bg-[#151515] border border-white/5 rounded px-3 py-1.5 text-xs text-amber-400 font-mono text-center focus:outline-none focus:border-amber-500/40"
-                      />
-                      <button
-                        onClick={() => handleUpdateLimit(monthlyLimitSeconds)}
-                        className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-sans font-bold text-[10px] uppercase tracking-widest rounded transition-all cursor-pointer"
-                      >
-                        Save
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Users list */}
-                <div className="bg-[#0F0F0F] border border-white/5 rounded-lg p-5 lg:col-span-2 space-y-4">
-                  <div className="flex items-center justify-between border-b border-white/5 pb-2">
-                    <div className="flex items-center gap-2">
-                      <Users className="w-4 h-4 text-amber-500" />
-                      <h3 className="text-xs font-serif text-white uppercase tracking-wider">Registered Users & Consumption</h3>
-                    </div>
-                    <span className="text-[9px] text-slate-600 font-mono">Real-time stats</span>
-                  </div>
-
-                  <div className="overflow-x-auto max-h-60 overflow-y-auto space-y-2 pr-1">
-                    {adminData?.users?.map((usr: any) => (
-                      <div key={usr.email} className="flex items-center justify-between p-3 bg-[#141414] rounded border border-white/5 text-xs">
-                        <div className="min-w-0 pr-2">
-                          <span className="font-serif text-white truncate block">{usr.email}</span>
-                          <span className="text-[8px] font-mono uppercase text-slate-500 block mt-0.5">
-                            Signup: {new Date(usr.createdAt).toLocaleDateString()} | Role: {usr.role}
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-3 shrink-0">
-                          <div className="text-right">
-                            <span className="font-mono text-amber-400 block">{Math.floor(usr.usedSeconds / 60)}m {Math.round(usr.usedSeconds % 60)}s</span>
-                            <span className="text-[8px] font-mono text-slate-600 uppercase block">Used</span>
-                          </div>
-                          {usr.role !== 'admin' && (
-                            <button
-                              onClick={() => handleResetUserUsage(usr.email)}
-                              className="px-2 py-1 bg-white/5 hover:bg-amber-500/10 hover:text-amber-400 border border-white/5 hover:border-amber-500/20 rounded text-[9px] font-mono uppercase tracking-wider transition-all cursor-pointer"
-                              title="Reset usage counters back to zero"
-                            >
-                              Reset
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              {/* Audit Logs & Feedbacks */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                {/* Feedbacks */}
-                <div className="bg-[#0F0F0F] border border-white/5 rounded-lg p-5 space-y-4">
-                  <div className="flex items-center justify-between border-b border-white/5 pb-2">
-                    <div className="flex items-center gap-2">
-                      <MessageSquare className="w-4 h-4 text-amber-500" />
-                      <h3 className="text-xs font-serif text-white uppercase tracking-wider">Direct enquiries (althafka944@gmail.com)</h3>
-                    </div>
-                    <span className="text-[9px] text-slate-600 font-mono">Latest inquiries</span>
-                  </div>
-
-                  <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
-                    {adminData?.feedbacks?.length === 0 ? (
-                      <div className="p-6 text-center text-slate-600 text-xs italic">
-                        No enquiries received yet.
-                      </div>
-                    ) : (
-                      adminData?.feedbacks?.map((fb: any) => (
-                        <div key={fb.id} className="p-3.5 bg-[#141414] rounded border border-white/5 space-y-2 text-xs">
-                          <div className="flex items-center justify-between">
-                            <span className="font-serif text-white font-medium">{fb.topic}</span>
-                            <span className="text-[8px] font-mono text-slate-600">{new Date(fb.createdAt).toLocaleDateString()}</span>
-                          </div>
-                          <p className="text-slate-400 font-sans leading-relaxed text-xs">{fb.message}</p>
-                          <span className="text-[9px] font-mono text-slate-500 uppercase block mt-1">Sender: {fb.email}</span>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </div>
-
-                {/* Audit Logs */}
-                <div className="bg-[#0F0F0F] border border-white/5 rounded-lg p-5 space-y-4">
-                  <div className="flex items-center justify-between border-b border-white/5 pb-2">
-                    <div className="flex items-center gap-2">
-                      <Sliders className="w-4 h-4 text-amber-500" />
-                      <h3 className="text-xs font-serif text-white uppercase tracking-wider">Secure File Audit Logs</h3>
-                    </div>
-                    <span className="text-[9px] text-slate-600 font-mono">Transaction feed</span>
-                  </div>
-
-                  <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
-                    {adminData?.logs?.map((log: any) => (
-                      <div key={log.id} className="p-2.5 bg-[#141414] rounded border border-white/5 text-[11px] flex justify-between gap-2">
-                        <div className="min-w-0">
-                          <span className="font-mono text-slate-400 block leading-tight">{log.action}</span>
-                          <span className="text-[9px] font-mono text-slate-600 uppercase block mt-1">User: {log.email} {log.filename ? `| File: ${log.filename}` : ''}</span>
-                        </div>
-                        <span className="text-[8px] font-mono text-slate-600 shrink-0 text-right align-top">{new Date(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        ) : activeMainView === 'feedback' ? (
-          <div className="flex-1 overflow-y-auto p-6 md:p-8 bg-[#070707] flex items-center justify-center">
-            <div className="w-full max-w-lg bg-[#0F0F0F] border border-white/5 rounded-xl p-8 space-y-6 shadow-2xl">
-              <div className="text-center space-y-2 border-b border-white/5 pb-5">
-                <Mail className="w-8 h-8 text-amber-500 mx-auto" />
-                <h2 className="font-serif text-white text-lg tracking-wider uppercase">Direct Enquiry Service</h2>
-                <p className="text-[10px] text-slate-500 font-mono leading-relaxed">
-                  Have any questions, bug reports, or request for custom monthly limits? Send a direct feedback which routes instantly to althafka944@gmail.com.
-                </p>
-              </div>
-
-              <form onSubmit={handleSubmitFeedback} className="space-y-4">
-                <div className="space-y-1.5">
-                  <label className="text-[9px] text-slate-500 uppercase font-mono tracking-widest block">Sender Email</label>
-                  <input
-                    type="email"
-                    disabled
-                    value={currentUser?.email}
-                    className="w-full bg-[#151515] border border-white/5 rounded px-3.5 py-2.5 text-xs text-slate-500 font-sans cursor-not-allowed"
-                  />
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-[9px] text-slate-500 uppercase font-mono tracking-widest block">Inquiry Category</label>
-                  <select
-                    value={feedbackTopic}
-                    onChange={(e) => setFeedbackTopic(e.target.value)}
-                    className="w-full bg-[#151515] text-slate-300 text-xs font-sans border border-white/5 rounded p-2.5 focus:outline-none focus:border-amber-500/40"
-                  >
-                    <option value="Transcription Accuracy & Quality">Transcription Accuracy & Quality</option>
-                    <option value="Speaker Diarization Issue">Speaker Diarization Issue</option>
-                    <option value="Microphone Recording System">Microphone Recording System</option>
-                    <option value="Monthly Allowance Limit Increase">Monthly Allowance Limit Increase</option>
-                    <option value="General Query or Proposal">General Query or Proposal</option>
-                  </select>
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-[9px] text-slate-500 uppercase font-mono tracking-widest block">Your Message</label>
-                  <textarea
-                    required
-                    rows={5}
-                    value={feedbackMessage}
-                    onChange={(e) => setFeedbackMessage(e.target.value)}
-                    placeholder="Please write your feedback details here. The system administrator will review this and respond shortly."
-                    className="w-full bg-[#151515] border border-white/5 rounded px-3.5 py-2.5 text-xs text-slate-200 placeholder-slate-700 focus:outline-none focus:border-amber-500/40 font-sans leading-relaxed"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={feedbackSubmitting}
-                  className="w-full py-3 bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs uppercase tracking-widest rounded transition-all shadow-lg flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  {feedbackSubmitting ? <Loader2 className="w-4 h-4 animate-spin text-black" /> : <Send className="w-3.5 h-3.5 text-black" />}
-                  <span>Forward Enquiry directly to Owner</span>
-                </button>
-              </form>
-            </div>
-          </div>
-        ) : activeMainView === 'privacy' ? (
-          <div className="flex-1 overflow-y-auto p-6 md:p-8 bg-[#070707] space-y-6 flex items-center justify-center">
-            <div className="w-full max-w-2xl bg-[#0F0F0F] border border-white/5 rounded-xl p-8 md:p-10 space-y-6 shadow-2xl relative overflow-hidden">
-              <div className="absolute top-0 right-0 p-8 text-amber-500/10 pointer-events-none">
-                <ShieldCheck className="w-32 h-32" />
-              </div>
-
-              <div className="space-y-2 border-b border-white/5 pb-5">
-                <span className="text-[9px] text-amber-500 font-mono uppercase tracking-[0.2em] block">Data Governance & Sovereign Integrity</span>
-                <h1 className="font-serif text-white text-xl md:text-2xl tracking-wider uppercase">Scriptor Unified Privacy Policy</h1>
-                <p className="text-[10px] text-slate-500 font-mono uppercase tracking-widest mt-1">Last revised: July 15, 2026</p>
-              </div>
-
-              <div className="space-y-5 text-slate-300 font-sans text-xs md:text-sm leading-relaxed">
-                <p>
-                  Scriptor AI is engineered from the ground up with <strong>data minimization principles</strong>. We enforce strict physical constraints on how audio packets are ingested, parsed, and logged to ensure maximum confidentiality for our users.
-                </p>
-
-                <div className="space-y-2.5">
-                  <h3 className="text-xs font-serif text-white uppercase tracking-wider">1. Zero Persistent Media Caching</h3>
-                  <p className="text-slate-400 text-xs">
-                    We never write raw audio uploads or microphone vocal recordings to permanent disc storage. Audio media is streamed as transient memory buffers, transmitted via encrypted API pipes, and cleared instantly once transcription diarization completes.
-                  </p>
-                </div>
-
-                <div className="space-y-2.5">
-                  <h3 className="text-xs font-serif text-white uppercase tracking-wider">2. Secure Google Gemini Pipeline</h3>
-                  <p className="text-slate-400 text-xs">
-                    Vocal signals are converted directly on HTTPS channels utilizing TLS 1.3 protocol. AI parsing is carried out via secure, private enterprise Google Gemini endpoints. Your data is strictly private and is never used for training models or analytics.
-                  </p>
-                </div>
-
-                <div className="space-y-2.5">
-                  <h3 className="text-xs font-serif text-white uppercase tracking-wider">3. Exclusive Owner Authority (althafka944@gmail.com)</h3>
-                  <p className="text-slate-400 text-xs">
-                    This platform is owned and managed by althafka944@gmail.com. General clients are allocated 1 hour 15 minutes of transcription monthly limit. Operational telemetry (metadata such as duration and transcript titles) is logged securely for administrative audits.
-                  </p>
-                </div>
-
-                <div className="space-y-2.5">
-                  <h3 className="text-xs font-serif text-white uppercase tracking-wider">4. Absolute Client Sovereignty</h3>
-                  <p className="text-slate-400 text-xs">
-                    You maintain complete custody and copyrights over your transcriptions. You can download files locally in SRT Subtitles, JSON, or TXT formats, or permanently delete records from our indexes with a single click.
-                  </p>
-                </div>
-              </div>
-
-              <div className="pt-4 border-t border-white/5 text-center">
-                <button
-                  onClick={() => setActiveMainView('workspace')}
-                  className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-black font-sans font-bold text-xs uppercase tracking-widest rounded transition-all shadow-md cursor-pointer"
-                >
-                  Return to Workspace
-                </button>
-              </div>
-            </div>
-          </div>
-        ) : isTranscribing ? (
-          <div className="flex-1 flex flex-col items-center justify-center bg-[#0A0A0A] p-8 text-center">
-            <Loader2 className="w-12 h-12 text-amber-500 animate-spin mb-4" />
-            <h3 className="text-base font-serif text-white tracking-wide">Scriptor AI Processing Pipeline</h3>
-            <p className="text-xs text-slate-500 mt-2 max-w-xs leading-relaxed font-mono">
-              Analyzing vocal signatures, assigning speaker segment IDs, and formatting high-fidelity dialogue metadata.
-            </p>
-            <div className="w-64 bg-[#151515] h-2 rounded-full overflow-hidden mt-6 border border-white/5">
-              <div className="bg-amber-500 h-full transition-all duration-300" style={{ width: `${transcriptionProgress}%` }}></div>
-            </div>
-            <span className="text-[10px] text-slate-600 font-mono mt-2">{transcriptionProgress}% completed</span>
-          </div>
-        ) : activeTranscript ? (
-          <div className="flex-1 flex flex-col overflow-hidden">
-            <audio 
-              ref={audioElRef} 
-              src={activeAudioUrl || undefined} 
-              className="hidden" 
-              onTimeUpdate={() => {
-                if (audioElRef.current) {
-                  setCurrentTime(Math.floor(audioElRef.current.currentTime));
-                }
-              }}
-              onLoadedMetadata={() => {
-                if (audioElRef.current) {
-                  setDuration(Math.floor(audioElRef.current.duration));
-                }
-              }}
-              onEnded={() => {
-                setIsPlaying(false);
-                setCurrentTime(0);
-              }}
-            />
+        {activeMainView === 'workspace' && (
+          <div className="space-y-12">
             
-            {/* 🎵 AUDIO PLAYER CONTROL PANEL WITH LIVE WAVEFORM ANIMATION */}
-            <div className="bg-[#111111] border-b border-white/5 p-5 md:px-8">
-              <div className="flex flex-col lg:flex-row items-center justify-between gap-5">
-                
-                {/* Audio Controls */}
-                <div className="flex items-center gap-4">
-                  <button
-                    id="player-rewind"
-                    onClick={() => {
-                      setCurrentTime(0);
-                      if (audioElRef.current && activeAudioUrl) {
-                        audioElRef.current.currentTime = 0;
-                      }
-                    }}
-                    className="p-2.5 bg-[#1C1C1C] hover:bg-[#252525] border border-white/5 rounded-full text-slate-400 hover:text-white transition-all"
-                    title="Rewind to start"
-                  >
-                    <RotateCcw className="w-4 h-4" />
-                  </button>
-                  <button
-                    id="player-play-toggle"
-                    onClick={() => setIsPlaying(!isPlaying)}
-                    className="p-4 bg-amber-500 hover:bg-amber-400 rounded-full text-black transition-all shadow-lg shadow-amber-500/10"
-                    title={isPlaying ? 'Pause playback' : 'Play transcription'}
-                  >
-                    {isPlaying ? <Pause className="w-5 h-5 fill-current" /> : <Play className="w-5 h-5 fill-current ml-0.5" />}
-                  </button>
-                  <div className="text-xs font-mono text-slate-400 min-w-[100px]">
-                    <span className="text-white font-semibold">{formatTime(currentTime)}</span>
-                    <span className="text-slate-600 mx-1">/</span>
-                    <span>{activeTranscript.duration}</span>
-                  </div>
+            {/* 📥 INGESTION & CALIBRATION DESK */}
+            <section className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+              
+              {/* Left Column: Media Ingestion */}
+              <div className="lg:col-span-7 bg-[#0F0F0F] border border-white/5 rounded-xl p-6 md:p-8 space-y-6 shadow-2xl">
+                <div className="flex items-center gap-2.5 border-b border-white/5 pb-4">
+                  <Upload className="w-5 h-5 text-amber-500" />
+                  <h2 className="text-sm font-serif font-bold text-white uppercase tracking-wider">Audio Upload Station</h2>
                 </div>
 
-                {/* Live Responsive Waveform Visualization */}
-                <div className="flex-1 max-w-lg w-full flex items-center justify-center gap-[3px] h-8 overflow-hidden px-4">
-                  {Array.from({ length: 48 }).map((_, idx) => {
-                    // Generate nice wave shapes
-                    const baseHeight = Math.sin((idx / 48) * Math.PI * 2.5) * 14 + 16;
-                    const bounce = isPlaying ? Math.random() * 12 : 1;
-                    const finalHeight = Math.max(4, Math.min(32, baseHeight + bounce));
-                    
-                    // Highlight played wave segments
-                    const isPlayed = (idx / 48) * duration < currentTime;
-
-                    return (
-                      <div 
-                        key={idx}
-                        className={`w-[4px] rounded-full transition-all duration-300 ${
-                          isPlayed ? 'bg-amber-500' : 'bg-[#222222]'
-                        }`}
-                        style={{ height: `${finalHeight}px` }}
-                      ></div>
-                    );
-                  })}
-                </div>
-
-                {/* Speed & Volume modifiers */}
-                <div className="flex items-center gap-5">
-                  <div className="flex items-center gap-1.5 bg-[#151515] p-1 rounded border border-white/5">
-                    {['1x', '1.25x', '1.5x', '2x'].map((speed) => {
-                      const speedNum = parseFloat(speed);
-                      return (
-                        <button
-                          key={speed}
-                          onClick={() => setPlaybackSpeed(speedNum)}
-                          className={`px-2 py-0.5 text-[9px] uppercase tracking-wider font-mono font-bold rounded ${
-                            playbackSpeed === speedNum ? 'bg-amber-500 text-black' : 'text-slate-500 hover:text-slate-300'
-                          }`}
-                        >
-                          {speed}
-                        </button>
-                      );
-                    })}
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => setIsMuted(!isMuted)}
-                      className="p-1.5 hover:bg-[#1A1A1A] text-slate-400 hover:text-white rounded"
-                    >
-                      {isMuted || volume === 0 ? <VolumeX className="w-4 h-4" /> : volume < 0.5 ? <Volume1 className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
-                    </button>
+                <div className="space-y-4">
+                  {/* File Upload Zone - full width */}
+                  <div 
+                    id="drop-zone"
+                    onDragOver={handleDragOver}
+                    onDrop={handleDrop}
+                    onClick={() => fileInputRef.current?.click()}
+                    className="border border-dashed border-white/10 hover:border-amber-500/30 rounded-xl p-8 text-center cursor-pointer bg-[#121212]/50 hover:bg-[#121212] transition-all group flex flex-col justify-center items-center space-y-4 min-h-[220px]"
+                  >
+                    <Upload className="w-10 h-10 text-slate-500 group-hover:text-amber-500 transition-colors" />
+                    <div className="space-y-1">
+                      <div className="text-sm text-slate-300 font-bold uppercase tracking-wider">Upload Audio Document</div>
+                      <div className="text-[11px] text-slate-500 font-mono">WAV, MP3, M4A, WEBM, OGG, or FLAC up to 200MB (45+ minutes)</div>
+                    </div>
+                    <span className="px-4 py-2 bg-amber-500/10 text-amber-400 group-hover:bg-amber-500 group-hover:text-black text-[10px] font-mono uppercase tracking-wider rounded font-bold transition-all">
+                      Browse Files
+                    </span>
                     <input 
-                      type="range"
-                      min="0"
-                      max="1"
-                      step="0.1"
-                      value={isMuted ? 0 : volume}
-                      onChange={(e) => {
-                        setVolume(parseFloat(e.target.value));
-                        setIsMuted(false);
-                      }}
-                      className="w-16 accent-amber-500 h-1 bg-[#222] rounded-lg appearance-none"
+                      ref={fileInputRef}
+                      type="file" 
+                      accept="audio/*" 
+                      className="hidden" 
+                      onChange={handleFileChange} 
                     />
                   </div>
                 </div>
+              </div>
 
+              {/* Right Column: Settings & History */}
+              <div className="lg:col-span-5 bg-[#0F0F0F] border border-white/5 rounded-xl p-6 md:p-8 space-y-6 shadow-2xl h-full flex flex-col">
+                <div className="flex items-center gap-2.5 border-b border-white/5 pb-4 shrink-0">
+                  <Sliders className="w-5 h-5 text-amber-500" />
+                  <h2 className="text-sm font-serif font-bold text-white uppercase tracking-wider">Settings & History</h2>
+                </div>
+
+                <div className="space-y-6 flex-1 flex flex-col justify-between">
+                  {/* Saved Transcripts Vault */}
+                  <div className="space-y-2.5">
+                    <label className="text-[10px] text-slate-400 font-mono uppercase tracking-widest block font-bold">Transcription History</label>
+                    {savedTranscriptions.length === 0 ? (
+                      <div className="text-center py-8 text-slate-600 text-xs italic bg-[#121212] rounded border border-white/5">
+                        No transcripts saved yet.
+                      </div>
+                    ) : (
+                      <div className="space-y-2 max-h-[200px] overflow-y-auto pr-1">
+                        {savedTranscriptions.map((t) => (
+                          <div
+                            key={t.id}
+                            className={`w-full p-2.5 rounded border transition-all flex items-center justify-between text-xs font-mono uppercase tracking-wide ${
+                              t.id === activeId
+                                ? 'bg-amber-500/10 border-amber-500/30 text-amber-500'
+                                : 'bg-[#121212] border-white/5 text-slate-400 hover:text-white hover:border-white/10'
+                            }`}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveId(t.id);
+                                showToast(`Loaded ${t.title}`, 'info');
+                              }}
+                              className="flex-1 text-left truncate font-semibold pr-2 cursor-pointer text-xs"
+                            >
+                              {t.title}
+                            </button>
+                            <span className="text-[9px] text-slate-500 shrink-0 select-none mr-2">{t.duration}</span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const filtered = savedTranscriptions.filter(item => item.id !== t.id);
+                                saveTranscriptions(filtered);
+                                if (activeId === t.id && filtered.length > 0) {
+                                  setActiveId(filtered[0].id);
+                                } else if (filtered.length === 0) {
+                                  setActiveId('');
+                                }
+                                showToast('Transcript removed', 'success');
+                              }}
+                              className="text-slate-600 hover:text-red-400 p-1 rounded hover:bg-white/5 transition-colors cursor-pointer"
+                              title="Delete transcript"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="bg-[#121212] p-3.5 rounded-lg border border-white/5 space-y-2.5">
+                    <label className="text-[10px] text-slate-400 font-mono uppercase tracking-widest block font-bold">Language Identification</label>
+                    <select 
+                      value={language}
+                      onChange={(e) => setLanguage(e.target.value)}
+                      className="w-full bg-[#1C1C1C] text-slate-300 text-xs font-mono border border-white/5 rounded py-2.5 px-3 focus:outline-none focus:border-amber-500/30 cursor-pointer"
+                    >
+                      <option value="Auto">Detect Automatically</option>
+                      <option value="English">English</option>
+                      <option value="Spanish">Spanish (Español)</option>
+                      <option value="Japanese">Japanese (日本語)</option>
+                      <option value="Indonesian">Indonesian (Bahasa Indonesia)</option>
+                      <option value="German">German (Deutsch)</option>
+                      <option value="French">French (Français)</option>
+                      <option value="Portuguese">Portuguese</option>
+                      <option value="Italian">Italian</option>
+                      <option value="Chinese">Chinese (中文)</option>
+                      <option value="Arabic">Arabic</option>
+                      <option value="Hindi">Hindi</option>
+                      <option value="Russian">Russian</option>
+                      <option value="Korean">Korean (한국어)</option>
+                      <option value="Turkish">Turkish</option>
+                      <option value="Vietnamese">Vietnamese</option>
+                      <option value="Dutch">Dutch</option>
+                      <option value="Swedish">Swedish</option>
+                      <option value="Polish">Polish</option>
+                      <option value="Tagalog">Tagalog</option>
+                      <option value="Ukrainian">Ukrainian</option>
+                      <option value="Hebrew">Hebrew</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+
+
+          </div>
+        )}
+
+        {/* 1. SECURE OWNER CONSOLE VIEW */}
+        {activeMainView === 'admin' && adminData && (
+          <div className="bg-[#0F0F0F] border border-white/5 rounded-xl p-6 md:p-8 space-y-8 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-white/5 pb-4">
+              <div className="flex items-center gap-3">
+                <span className="text-xs bg-amber-500/10 text-amber-500 font-mono uppercase font-bold tracking-widest px-2 py-1 rounded border border-amber-500/20">
+                  Owner console
+                </span>
+                <h1 className="font-serif text-white text-lg md:text-xl tracking-wide uppercase">
+                  Administration Dashboard
+                </h1>
               </div>
             </div>
 
-            {/* SEGMENTS LIST: Precision Audio to Perfect Text */}
-            <div className="flex-1 overflow-y-auto p-6 md:p-8 bg-[#0A0A0A] space-y-5">
-              <div className="max-w-3xl mx-auto space-y-4">
-                
-                <div className="flex items-center justify-between text-[10px] font-mono text-slate-500 uppercase tracking-widest border-b border-white/5 pb-2">
-                  <span>Diarized Speakers & Statements</span>
-                  <span>Double-click name or statement to correct</span>
+            {/* Dashboard summary cards */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div className="bg-[#121212] border border-white/5 rounded-lg p-5">
+                <span className="text-[10px] text-slate-500 font-mono uppercase tracking-widest block">Authorized Signups</span>
+                <span className="text-2xl font-serif text-white block mt-1.5">{adminData.users?.length || 1}</span>
+                <span className="text-[9px] text-slate-600 font-mono uppercase block mt-1">Live profiles in database</span>
+              </div>
+              <div className="bg-[#121212] border border-white/5 rounded-lg p-5">
+                <span className="text-[10px] text-slate-500 font-mono uppercase tracking-widest block">Monthly Base Limit</span>
+                <span className="text-2xl font-serif text-amber-500 block mt-1.5">{Math.round(monthlyLimitSeconds / 60)} Mins</span>
+                <span className="text-[9px] text-slate-600 font-mono uppercase block mt-1">For general clients</span>
+              </div>
+              <div className="bg-[#121212] border border-white/5 rounded-lg p-5">
+                <span className="text-[10px] text-slate-500 font-mono uppercase tracking-widest block">Enquiries & Feedbacks</span>
+                <span className="text-2xl font-serif text-white block mt-1.5">{adminData.feedbacks?.length || 0}</span>
+                <span className="text-[9px] text-slate-600 font-mono uppercase block mt-1">Direct inquiries received</span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+              {/* Monthly limit config */}
+              <div className="lg:col-span-4 bg-[#121212] border border-white/5 rounded-lg p-5 space-y-4">
+                <div className="flex items-center gap-2 border-b border-white/5 pb-2">
+                  <Sliders className="w-4 h-4 text-amber-500" />
+                  <h3 className="text-xs font-serif text-white uppercase tracking-wider">Configure Limits</h3>
+                </div>
+                <p className="text-[10px] text-slate-500 leading-relaxed font-sans">
+                  As Scriptor's Owner, you can dynamically configure the transcription limit seconds granted to general clients.
+                </p>
+                <div className="space-y-2">
+                  <label className="text-[9px] text-slate-500 uppercase font-mono tracking-wider block">Default Limit (Minutes)</label>
+                  <div className="flex gap-2">
+                    <input
+                      type="number"
+                      value={Math.round(monthlyLimitSeconds / 60)}
+                      onChange={(e) => setMonthlyLimitSeconds((parseInt(e.target.value) || 0) * 60)}
+                      className="flex-1 bg-[#1A1A1A] border border-white/5 rounded px-3 py-1.5 text-xs text-amber-400 font-mono text-center focus:outline-none"
+                    />
+                    <button
+                      onClick={() => handleUpdateLimit(monthlyLimitSeconds)}
+                      className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-sans font-bold text-[10px] uppercase tracking-widest rounded transition-all cursor-pointer"
+                    >
+                      Save
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Users list */}
+              <div className="lg:col-span-8 bg-[#121212] border border-white/5 rounded-lg p-5 space-y-4">
+                <div className="flex items-center justify-between border-b border-white/5 pb-2">
+                  <div className="flex items-center gap-2">
+                    <Users className="w-4 h-4 text-amber-500" />
+                    <h3 className="text-xs font-serif text-white uppercase tracking-wider">Registered Users & Consumption</h3>
+                  </div>
+                  <span className="text-[9px] text-slate-600 font-mono">Real-time stats</span>
                 </div>
 
-                {activeTranscript.segments.map((seg, index) => {
-                  const isCurrent = currentTime >= parseTimestampToSeconds(seg.timestamp) && 
-                    (index === activeTranscript.segments.length - 1 || currentTime < parseTimestampToSeconds(activeTranscript.segments[index+1].timestamp));
+                <div className="overflow-x-auto max-h-60 overflow-y-auto space-y-2 pr-1">
+                  {adminData.users?.map((usr: any) => (
+                    <div key={usr.email} className="flex items-center justify-between p-3 bg-[#1A1A1A] rounded border border-white/5 text-xs">
+                      <div className="min-w-0 pr-2">
+                        <span className="font-serif text-white truncate block">{usr.email}</span>
+                        <span className="text-[8px] font-mono uppercase text-slate-500 block mt-0.5">
+                          Signup: {new Date(usr.createdAt).toLocaleDateString()} | Role: {usr.role}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-3 shrink-0">
+                        <div className="text-right">
+                          <span className="font-mono text-amber-400 block">{Math.floor(usr.usedSeconds / 60)}m {Math.round(usr.usedSeconds % 60)}s</span>
+                          <span className="text-[8px] font-mono text-slate-600 uppercase block">Used</span>
+                        </div>
+                        {usr.role !== 'admin' && (
+                          <button
+                            onClick={() => handleResetUserUsage(usr.email)}
+                            className="px-2 py-1 bg-white/5 hover:bg-amber-500/10 hover:text-amber-400 border border-white/5 hover:border-amber-500/20 rounded text-[9px] font-mono uppercase tracking-wider transition-all cursor-pointer"
+                          >
+                            Reset
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
 
-                  return (
-                    <div
-                      key={seg.id}
-                      id={`segment-${seg.id}`}
-                      className={`group flex items-start gap-4 p-4 rounded-lg border transition-all duration-300 ${
-                        isCurrent 
-                          ? 'bg-amber-500/[0.03] border-amber-500/25 shadow-md' 
-                          : 'bg-[#0F0F0F] border-white/5 hover:border-white/10'
-                      }`}
+            {/* Audit Logs & Feedbacks */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              {/* Feedbacks */}
+              <div className="bg-[#121212] border border-white/5 rounded-lg p-5 space-y-4">
+                <div className="flex items-center justify-between border-b border-white/5 pb-2">
+                  <div className="flex items-center gap-2">
+                    <MessageSquare className="w-4 h-4 text-amber-500" />
+                    <h3 className="text-xs font-serif text-white uppercase tracking-wider">Direct enquiries</h3>
+                  </div>
+                  <span className="text-[9px] text-slate-600 font-mono">Latest inquiries</span>
+                </div>
+
+                <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
+                  {adminData.feedbacks?.length === 0 ? (
+                    <div className="p-6 text-center text-slate-600 text-xs italic">
+                      No enquiries received yet.
+                    </div>
+                  ) : (
+                    adminData.feedbacks?.map((fb: any) => (
+                      <div key={fb.id} className="p-3.5 bg-[#1A1A1A] rounded border border-white/5 space-y-2 text-xs">
+                        <div className="flex items-center justify-between">
+                          <span className="font-serif text-white font-medium">{fb.topic}</span>
+                          <span className="text-[8px] font-mono text-slate-600">{new Date(fb.createdAt).toLocaleDateString()}</span>
+                        </div>
+                        <p className="text-slate-400 font-sans leading-relaxed text-xs">{fb.message}</p>
+                        <span className="text-[9px] font-mono text-slate-500 uppercase block mt-1">Sender: {fb.email}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {/* Audit Logs */}
+              <div className="bg-[#121212] border border-white/5 rounded-lg p-5 space-y-4">
+                <div className="flex items-center justify-between border-b border-white/5 pb-2">
+                  <div className="flex items-center gap-2">
+                    <Sliders className="w-4 h-4 text-amber-500" />
+                    <h3 className="text-xs font-serif text-white uppercase tracking-wider">Secure File Audit Logs</h3>
+                  </div>
+                  <span className="text-[9px] text-slate-600 font-mono">Transaction feed</span>
+                </div>
+
+                <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                  {adminData.logs?.map((log: any) => (
+                    <div key={log.id} className="p-2.5 bg-[#1A1A1A] rounded border border-white/5 text-[11px] flex justify-between gap-2">
+                      <div className="min-w-0">
+                        <span className="font-mono text-slate-400 block leading-tight">{log.action}</span>
+                        <span className="text-[9px] font-mono text-slate-600 uppercase block mt-1">User: {log.email} {log.filename ? `| File: ${log.filename}` : ''}</span>
+                      </div>
+                      <span className="text-[8px] font-mono text-slate-600 shrink-0 text-right align-top">{new Date(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 2. DIRECT ENQUIRY SERVICE VIEW */}
+        {activeMainView === 'feedback' && (
+          <div className="bg-[#0F0F0F] border border-white/5 rounded-xl p-8 space-y-6 shadow-2xl max-w-2xl mx-auto">
+            <div className="text-center space-y-2 border-b border-white/5 pb-5">
+              <Mail className="w-8 h-8 text-amber-500 mx-auto" />
+              <h2 className="font-serif text-white text-lg tracking-wider uppercase">Direct Enquiry Service</h2>
+              <p className="text-[10px] text-slate-500 font-mono leading-relaxed">
+                Have any questions, bug reports, or request for custom monthly limits? Send a direct feedback which routes instantly to althafka944@gmail.com.
+              </p>
+            </div>
+
+            <form onSubmit={handleSubmitFeedback} className="space-y-4">
+              <div className="space-y-1.5">
+                <label className="text-[9px] text-slate-500 uppercase font-mono tracking-widest block">Sender Email</label>
+                <input
+                  type="email"
+                  disabled
+                  value={currentUser?.email}
+                  className="w-full bg-[#151515] border border-white/5 rounded px-3.5 py-2.5 text-xs text-slate-500 font-sans cursor-not-allowed"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[9px] text-slate-500 uppercase font-mono tracking-widest block">Inquiry Category</label>
+                <select
+                  value={feedbackTopic}
+                  onChange={(e) => setFeedbackTopic(e.target.value)}
+                  className="w-full bg-[#151515] text-slate-300 text-xs font-sans border border-white/5 rounded p-2.5 focus:outline-none focus:border-amber-500/40"
+                >
+                  <option value="Transcription Accuracy & Quality">Transcription Accuracy & Quality</option>
+                  <option value="Speaker Diarization Issue">Speaker Diarization Issue</option>
+                  <option value="Microphone Recording System">Microphone Recording System</option>
+                  <option value="Monthly Allowance Limit Increase">Monthly Allowance Limit Increase</option>
+                  <option value="General Query or Proposal">General Query or Proposal</option>
+                </select>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[9px] text-slate-500 uppercase font-mono tracking-widest block">Your Message</label>
+                <textarea
+                  required
+                  rows={5}
+                  value={feedbackMessage}
+                  onChange={(e) => setFeedbackMessage(e.target.value)}
+                  placeholder="Please write your feedback details here. The system administrator will review this and respond shortly."
+                  className="w-full bg-[#151515] border border-white/5 rounded px-3.5 py-2.5 text-xs text-slate-200 placeholder-slate-700 focus:outline-none focus:border-amber-500/40 font-sans leading-relaxed"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={feedbackSubmitting}
+                className="w-full py-3 bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs uppercase tracking-widest rounded transition-all shadow-lg flex items-center justify-center gap-2 cursor-pointer"
+              >
+                {feedbackSubmitting ? <Loader2 className="w-4 h-4 animate-spin text-black" /> : <Send className="w-3.5 h-3.5 text-black" />}
+                <span>Forward Enquiry directly to Owner</span>
+              </button>
+            </form>
+          </div>
+        )}
+
+        {/* 3. COMPLIANCE & PRIVACY POLICY VIEW */}
+        {activeMainView === 'privacy' && (
+          <div className="w-full max-w-2xl bg-[#0F0F0F] border border-white/5 rounded-xl p-8 md:p-10 space-y-6 shadow-2xl mx-auto relative overflow-hidden">
+            <div className="absolute top-0 right-0 p-8 text-amber-500/10 pointer-events-none">
+              <ShieldCheck className="w-32 h-32" />
+            </div>
+
+            <div className="space-y-2 border-b border-white/5 pb-5">
+              <span className="text-[9px] text-amber-500 font-mono uppercase tracking-[0.2em] block">Data Governance & Sovereign Integrity</span>
+              <h1 className="font-serif text-white text-xl md:text-2xl tracking-wider uppercase">Scriptor Unified Privacy Policy</h1>
+              <p className="text-[10px] text-slate-500 font-mono uppercase tracking-widest mt-1">Last revised: July 15, 2026</p>
+            </div>
+
+            <div className="space-y-5 text-slate-300 font-sans text-xs md:text-sm leading-relaxed">
+              <p>
+                Scriptor AI is engineered from the ground up with <strong>data minimization principles</strong>. We enforce strict physical constraints on how audio packets are ingested, parsed, and logged to ensure maximum confidentiality for our users.
+              </p>
+
+              <div className="space-y-2.5">
+                <h3 className="text-xs font-serif text-white uppercase tracking-wider">1. Zero Persistent Media Caching</h3>
+                <p className="text-slate-400 text-xs">
+                  We never write raw audio uploads or microphone vocal recordings to permanent disc storage. Audio media is streamed as transient memory buffers, transmitted via encrypted API pipes, and cleared instantly once transcription diarization completes.
+                </p>
+              </div>
+
+              <div className="space-y-2.5">
+                <h3 className="text-xs font-serif text-white uppercase tracking-wider">2. Secure Google Gemini Pipeline</h3>
+                <p className="text-slate-400 text-xs">
+                  Vocal signals are converted directly on HTTPS channels utilizing TLS 1.3 protocol. AI parsing is carried out via secure, private enterprise Google Gemini endpoints. Your data is strictly private and is never used for training models or analytics.
+                </p>
+              </div>
+
+              <div className="space-y-2.5">
+                <h3 className="text-xs font-serif text-white uppercase tracking-wider">3. Exclusive Owner Authority (althafka944@gmail.com)</h3>
+                <p className="text-slate-400 text-xs">
+                  This platform is owned and managed by althafka944@gmail.com. General clients are allocated 1 hour 15 minutes of transcription monthly limit. Operational telemetry (metadata such as duration and transcript titles) is logged securely for administrative audits.
+                </p>
+              </div>
+
+              <div className="space-y-2.5">
+                <h3 className="text-xs font-serif text-white uppercase tracking-wider">4. Absolute Client Sovereignty</h3>
+                <p className="text-slate-400 text-xs">
+                  You maintain complete custody and copyrights over your transcriptions. You can download files locally in SRT Subtitles, JSON, or TXT formats, or permanently delete records from our indexes with a single click.
+                </p>
+              </div>
+            </div>
+
+            <div className="pt-4 border-t border-white/5 text-center">
+              <button
+                onClick={() => setActiveMainView('workspace')}
+                className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-black font-sans font-bold text-xs uppercase tracking-widest rounded transition-all shadow-md cursor-pointer"
+              >
+                Return to Workspace
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 4. ACTIVE TRANSCRIBING OR EDITING WORKSPACE PANEL */}
+        {activeMainView === 'workspace' && (
+          <div id="active-workspace-panel" className="scroll-mt-24 space-y-6">
+            
+            {/* If transcribing, render the pipeline loader */}
+            {isTranscribing && (
+              <div className="flex flex-col items-center justify-center bg-[#0F0F0F] border border-white/5 rounded-xl p-12 text-center shadow-2xl">
+                <Loader2 className="w-12 h-12 text-amber-500 animate-spin mb-4" />
+                <h3 className="text-base font-serif text-white tracking-wide uppercase">Scriptor AI Processing Pipeline</h3>
+                <p className="text-xs text-slate-500 mt-2 max-w-xs leading-relaxed font-mono">
+                  Analyzing vocal signatures, assigning speaker segment IDs, and formatting high-fidelity dialogue metadata.
+                </p>
+                <div className="w-64 bg-[#151515] h-2 rounded-full overflow-hidden mt-6 border border-white/5">
+                  <div className="bg-amber-500 h-full transition-all duration-300" style={{ width: `${transcriptionProgress}%` }}></div>
+                </div>
+                <span className="text-[10px] text-slate-600 font-mono mt-2">{transcriptionProgress}% completed</span>
+              </div>
+            )}
+
+            {/* If transcript is active, render workspace */}
+            {!isTranscribing && activeTranscript && (
+              <div className="space-y-6">
+                
+                {/* Active Transcript Header with controls & downloads */}
+                <div className="bg-[#0F0F0F] border border-white/5 rounded-xl p-5 md:p-6 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-xl">
+                  <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+                    <span className="text-xs bg-emerald-500/15 text-emerald-400 font-mono uppercase font-bold tracking-widest px-2.5 py-1 rounded border border-emerald-500/25">
+                      Live
+                    </span>
+                    <div className="flex flex-col sm:flex-row sm:items-center gap-2.5">
+                      <span className="text-[9px] text-slate-500 font-mono uppercase tracking-wider">Document:</span>
+                      <span className="text-white text-xs font-serif font-bold uppercase tracking-wide bg-[#151515] border border-white/5 px-3 py-1.5 rounded select-all max-w-[320px] truncate">
+                        {activeTranscript.title}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <button
+                      id="copy-text-btn"
+                      onClick={handleCopyTranscriptText}
+                      className="p-2.5 bg-[#151515] border border-white/5 hover:border-amber-500/30 text-slate-400 hover:text-amber-500 rounded transition-all cursor-pointer"
+                      title="Copy Full Transcript"
                     >
-                      {/* Segment play-jump trigger */}
-                      <button
-                        onClick={() => handleSeekToSegment(seg.timestamp)}
-                        className="flex items-center gap-1.5 bg-[#151515] hover:bg-[#1F1F1F] text-slate-500 hover:text-amber-400 text-[10px] font-mono px-2.5 py-1.5 rounded border border-white/5 transition-all mt-0.5 shadow-sm"
-                        title="Seek player here"
-                      >
-                        <Clock className="w-3 h-3 text-amber-500/70" />
-                        <span>{seg.timestamp}</span>
-                      </button>
+                      <Copy className="w-4 h-4" />
+                    </button>
 
-                      <div className="flex-1 space-y-2">
-                        {/* Speaker Identity Badge */}
-                        <div className="flex items-center gap-2">
-                          {editingSpeakerId === seg.id ? (
-                            <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
-                              <input
-                                type="text"
-                                value={editingSpeakerName}
-                                onChange={(e) => setEditingSpeakerName(e.target.value)}
-                                className="bg-[#1C1C1C] border border-amber-500/40 text-xs text-white px-2 py-0.5 rounded focus:outline-none font-medium"
-                                autoFocus
-                              />
-                              <button
-                                onClick={() => handleSaveSpeakerName(seg.id, seg.speaker)}
-                                className="p-1 bg-amber-500 text-black rounded hover:bg-amber-400"
-                              >
-                                <Check className="w-3 h-3" />
-                              </button>
-                              <button
-                                onClick={() => setEditingSpeakerId(null)}
-                                className="p-1 bg-[#252525] text-slate-400 rounded hover:text-white"
-                              >
-                                <X className="w-3 h-3" />
-                              </button>
-                            </div>
-                          ) : (
-                            <div className="flex items-center gap-1.5">
-                              <span className="text-xs font-serif font-semibold text-white tracking-wide uppercase">
-                                {seg.speaker}
-                              </span>
-                              <button
-                                onClick={() => handleStartEditingSpeaker(seg.id, seg.speaker)}
-                                className="opacity-0 group-hover:opacity-100 p-1 text-slate-600 hover:text-amber-400 rounded transition-all"
-                                title="Rename speaker globally"
-                              >
-                                <Edit2 className="w-3 h-3" />
-                              </button>
-                            </div>
-                          )}
+                    <button
+                      id="delete-active-btn"
+                      onClick={(e) => handleDeleteTranscription(activeTranscript.id, e)}
+                      className="p-2.5 bg-[#151515] border border-white/5 hover:border-red-500/30 text-slate-400 hover:text-red-500 rounded transition-all cursor-pointer"
+                      title="Delete This Transcript"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                    
+                    {/* Download Actions */}
+                    <div className="flex items-center bg-[#151515] rounded border border-white/5 p-0.5">
+                      <button
+                        id="dl-txt-btn"
+                        onClick={() => handleDownloadTranscript('txt')}
+                        className="px-3 py-1.5 text-[10px] uppercase tracking-wider font-bold text-slate-400 hover:text-white rounded cursor-pointer"
+                        title="Download Text Document"
+                      >
+                        TXT
+                      </button>
+                      <button
+                        id="dl-srt-btn"
+                        onClick={() => handleDownloadTranscript('srt')}
+                        className="px-3 py-1.5 text-[10px] uppercase tracking-wider font-bold text-slate-400 hover:text-white rounded border-l border-white/5 cursor-pointer"
+                        title="Download SRT Subtitle"
+                      >
+                        SRT
+                      </button>
+                      <button
+                        id="dl-json-btn"
+                        onClick={() => handleDownloadTranscript('json')}
+                        className="px-3 py-1.5 text-[10px] uppercase tracking-wider font-bold text-slate-400 hover:text-white rounded border-l border-white/5 cursor-pointer"
+                        title="Download JSON Structure"
+                      >
+                        JSON
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* TWO-COLUMN SIDE-BY-SIDE INTEGRATIVE PANELS */}
+                <div className="grid grid-cols-1 xl:grid-cols-12 gap-8 items-start">
+                  
+                  {/* Left Column (8 cols): Audio control and dialogue list */}
+                  <div className="xl:col-span-8 space-y-6">
+                    
+                    {/* 🎵 AUDIO PLAYER CONTROL PANEL */}
+                    <div className="bg-[#0F0F0F] border border-white/5 rounded-xl p-6 shadow-2xl">
+                      <audio 
+                        ref={audioElRef} 
+                        src={activeAudioUrl || undefined} 
+                        className="hidden" 
+                        onTimeUpdate={() => {
+                          if (audioElRef.current) {
+                            setCurrentTime(Math.floor(audioElRef.current.currentTime));
+                          }
+                        }}
+                        onLoadedMetadata={() => {
+                          if (audioElRef.current) {
+                            setDuration(Math.floor(audioElRef.current.duration));
+                          }
+                        }}
+                        onPlay={() => console.log("Audio started playing")}
+                        onPause={() => console.log("Audio paused")}
+                        onError={(e) => {
+                          console.error("Audio element error:", e);
+                          showToast("Audio playback issue. Format might not be supported.", "error");
+                        }}
+                        onEnded={() => {
+                          setIsPlaying(false);
+                          setCurrentTime(0);
+                        }}
+                      />
+
+                      <div className="flex flex-col lg:flex-row items-center justify-between gap-5">
+                        {/* Audio Controls */}
+                        <div className="flex items-center gap-4">
+                          <button
+                            id="player-rewind"
+                            onClick={() => { if (audioElRef.current) audioElRef.current.currentTime = Math.max(0, currentTime - 5); }}
+                            className="p-2.5 bg-[#151515] hover:bg-[#1C1C1C] text-slate-400 hover:text-white rounded border border-white/5 cursor-pointer transition-all"
+                            title="Skip Back 5s"
+                          >
+                            <RotateCcw className="w-4 h-4" />
+                          </button>
+
+                          <button
+                            id="player-play-pause"
+                            onClick={handlePlayPause}
+                            className="p-4 bg-amber-500 hover:bg-amber-400 text-black rounded-full shadow-lg shadow-amber-500/10 cursor-pointer transition-all transform hover:scale-105"
+                            title={isPlaying ? 'Pause' : 'Play'}
+                          >
+                            {isPlaying ? <Pause className="w-5 h-5 fill-current" /> : <Play className="w-5 h-5 fill-current ml-0.5" />}
+                          </button>
+
+                          <button
+                            id="player-forward"
+                            onClick={() => { if (audioElRef.current) audioElRef.current.currentTime = Math.min(duration, currentTime + 5); }}
+                            className="p-2.5 bg-[#151515] hover:bg-[#1C1C1C] text-slate-400 hover:text-white rounded border border-white/5 cursor-pointer transition-all"
+                            title="Skip Forward 5s"
+                          >
+                            <RotateCw className="w-4 h-4" />
+                          </button>
                         </div>
 
-                        {/* Text segment content */}
-                        <div>
-                          {editingSegmentId === seg.id ? (
-                            <div className="flex flex-col gap-2" onClick={(e) => e.stopPropagation()}>
-                              <textarea
-                                value={editingText}
-                                onChange={(e) => setEditingText(e.target.value)}
-                                className="w-full bg-[#1C1C1C] border border-amber-500/40 text-slate-200 text-sm p-2 rounded focus:outline-none leading-relaxed font-sans"
-                                rows={3}
-                                autoFocus
-                              />
-                              <div className="flex gap-2 justify-end">
-                                <button
-                                  onClick={() => setEditingSegmentId(null)}
-                                  className="px-2.5 py-1 text-[10px] uppercase tracking-wider font-semibold text-slate-400 hover:text-white rounded bg-[#252525]"
-                                >
-                                  Cancel
-                                </button>
-                                <button
-                                  onClick={() => handleSaveSegmentText(seg.id)}
-                                  className="px-2.5 py-1 text-[10px] uppercase tracking-wider font-bold text-black rounded bg-amber-500 hover:bg-amber-400"
-                                >
-                                  Save Correction
-                                </button>
-                              </div>
-                            </div>
-                          ) : (
-                            <p 
-                              onDoubleClick={() => handleStartEditingSegment(seg.id, seg.text)}
-                              className="text-slate-300 text-sm md:text-base leading-relaxed font-sans cursor-pointer hover:text-white hover:bg-white/[0.01] rounded py-0.5 px-1 transition-all"
-                            >
-                              {seg.text}
-                            </p>
-                          )}
+                        {/* Progress Slider */}
+                        <div className="flex-1 w-full space-y-2">
+                          <div className="flex justify-between text-[10px] font-mono text-slate-500">
+                            <span>{formatTime(currentTime)}</span>
+                            <span>{formatTime(duration)}</span>
+                          </div>
+                          <input 
+                            type="range"
+                            min="0"
+                            max={duration || 100}
+                            value={currentTime}
+                            onChange={(e) => {
+                              const val = parseInt(e.target.value);
+                              setCurrentTime(val);
+                              if (audioElRef.current) audioElRef.current.currentTime = val;
+                            }}
+                            className="w-full accent-amber-500 h-1 bg-[#1A1A1A] rounded-lg appearance-none cursor-pointer"
+                          />
+                        </div>
+
+                        {/* Volume and Mute Controls */}
+                        <div className="flex items-center gap-3">
+                          <button
+                            onClick={() => setIsMuted(!isMuted)}
+                            className="p-2 text-slate-400 hover:text-white transition-all"
+                            title={isMuted ? "Unmute" : "Mute"}
+                          >
+                            {isMuted ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4" />}
+                          </button>
+                          <input 
+                            type="range"
+                            min="0"
+                            max="1"
+                            step="0.1"
+                            value={isMuted ? 0 : volume}
+                            onChange={(e) => {
+                              setVolume(parseFloat(e.target.value));
+                              setIsMuted(false);
+                            }}
+                            className="w-16 accent-amber-500 h-1 bg-[#1A1A1A] rounded-lg appearance-none cursor-pointer"
+                          />
                         </div>
                       </div>
                     </div>
-                  );
-                })}
 
+                    {/* 📝 UNIFIED TRANSCRIPTION TEXT PANEL */}
+                    <div className="bg-[#0F0F0F] border border-white/5 rounded-xl p-6 md:p-8 space-y-6 shadow-2xl">
+                      <div className="flex items-center justify-between border-b border-white/5 pb-3">
+                        <div className="flex items-center gap-2">
+                          <FileText className="w-4 h-4 text-amber-500" />
+                          <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">Transcription Text</span>
+                        </div>
+                        {!isEditingFullText && (
+                          <button
+                            onClick={handleStartEditingFullText}
+                            className="text-[9px] font-mono uppercase bg-amber-500/10 text-amber-500 hover:bg-amber-500 hover:text-black border border-amber-500/20 rounded px-2 py-1 transition-all cursor-pointer font-bold"
+                          >
+                            Edit Transcript
+                          </button>
+                        )}
+                      </div>
+
+                      <div>
+                        {isEditingFullText ? (
+                          <div className="space-y-4">
+                            <textarea
+                              value={fullTextDraft}
+                              onChange={(e) => setFullTextDraft(e.target.value)}
+                              className="w-full bg-[#121212] border border-amber-500/40 text-slate-200 text-sm md:text-base p-5 rounded-lg focus:outline-none leading-relaxed font-sans min-h-[300px] resize-y"
+                              placeholder="Type or correct transcription text..."
+                            />
+                            <div className="flex gap-2.5 justify-end">
+                              <button
+                                onClick={() => setIsEditingFullText(false)}
+                                className="px-3.5 py-2 text-[10px] uppercase tracking-wider font-semibold text-slate-400 hover:text-white rounded bg-[#1C1C1C] border border-white/5 cursor-pointer"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                onClick={handleSaveFullText}
+                                className="px-3.5 py-2 text-[10px] uppercase tracking-wider font-bold text-black rounded bg-amber-500 hover:bg-amber-400 cursor-pointer shadow-md"
+                              >
+                                Save Changes
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="relative pl-8 space-y-6 before:absolute before:top-2 before:bottom-2 before:left-[17px] before:w-[2px] before:bg-white/10">
+                            {(() => {
+                              if (timelineItems.length === 0) {
+                                return (
+                                  <div className="bg-[#121212]/30 border border-white/5 rounded-lg p-5 min-h-[250px] flex items-center justify-center text-center">
+                                    <span className="italic text-slate-600 text-sm">No transcription content. Upload an audio document to generate transcription.</span>
+                                  </div>
+                                );
+                              }
+
+                              return timelineItems.map((item, idx) => {
+                                const nextItem = timelineItems[idx + 1];
+                                const isActive = nextItem 
+                                  ? (currentTime >= item.seconds && currentTime < nextItem.seconds)
+                                  : (currentTime >= item.seconds);
+
+                                return (
+                                  <div 
+                                    key={item.id} 
+                                    className={`relative flex flex-col sm:flex-row sm:items-start gap-4 p-4 rounded-lg border transition-all duration-300 group ${
+                                      isActive 
+                                        ? 'bg-amber-500/[0.04] border-amber-500/25 shadow-md shadow-amber-500/5' 
+                                        : 'bg-[#121212]/30 border-white/5 hover:border-white/10'
+                                    }`}
+                                  >
+                                    {/* Timeline Node Dot */}
+                                    <div className="absolute left-[-23px] top-[21px]">
+                                      <div className={`w-3.5 h-3.5 rounded-full border-2 transition-all duration-300 ${
+                                        isActive 
+                                          ? 'bg-amber-500 border-amber-500 scale-125 shadow-[0_0_10px_rgba(245,158,11,0.5)]' 
+                                          : 'bg-[#070707] border-white/20 group-hover:border-white/40'
+                                      }`} />
+                                    </div>
+
+                                    {/* Interactive Timestamp Badge */}
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setCurrentTime(item.seconds);
+                                        if (audioElRef.current && activeAudioUrl) {
+                                          audioElRef.current.currentTime = item.seconds;
+                                        }
+                                        setIsPlaying(true);
+                                        showToast(`Jumped playback to ${item.timestamp}`, 'info');
+                                      }}
+                                      className={`px-2.5 py-1 text-[9px] font-mono font-bold uppercase rounded border transition-all cursor-pointer shrink-0 sm:mt-0.5 text-center w-14 ${
+                                        isActive
+                                          ? 'bg-amber-500 text-black border-transparent shadow'
+                                          : 'bg-white/5 text-slate-400 border-white/5 hover:text-white hover:bg-white/10'
+                                      }`}
+                                      title="Click to seek here"
+                                    >
+                                      {item.timestamp}
+                                    </button>
+
+                                    {/* Sentence Text with Word-Level Active Highlight & Word-Level Seek */}
+                                    <div className="flex-1">
+                                      <p className={`text-sm md:text-base leading-relaxed transition-all ${
+                                        isActive 
+                                          ? 'text-white font-medium' 
+                                          : 'text-slate-300 group-hover:text-white'
+                                      }`}>
+                                        {(() => {
+                                          // Split keeping all whitespace/punctuation tokens
+                                          const tokens = item.text.split(/(\s+)/);
+                                          const realWordTokens = tokens.filter(t => t.trim().length > 0);
+                                          const totalRealWords = realWordTokens.length;
+
+                                          if (totalRealWords === 0) return item.text;
+
+                                          let realWordIdx = 0;
+                                          return tokens.map((token, tIdx) => {
+                                            const isWhitespace = token.trim().length === 0;
+                                            if (isWhitespace) {
+                                              return <span key={tIdx}>{token}</span>;
+                                            }
+
+                                            const currentRealWordIdx = realWordIdx;
+                                            realWordIdx++;
+
+                                            // Calculate precise timing range for this word
+                                            const wordDuration = (item.duration || 4) / totalRealWords;
+                                            const wordStart = item.seconds + currentRealWordIdx * wordDuration;
+                                            const wordEnd = wordStart + wordDuration;
+                                            const isWordActive = isActive && currentTime >= wordStart && currentTime < wordEnd;
+
+                                            return (
+                                              <span
+                                                key={tIdx}
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  setCurrentTime(wordStart);
+                                                  if (audioElRef.current && activeAudioUrl) {
+                                                    audioElRef.current.currentTime = wordStart;
+                                                  }
+                                                  setIsPlaying(true);
+                                                  showToast(`Seeked to: "${token.trim()}"`, 'info');
+                                                }}
+                                                className={`cursor-pointer transition-all duration-150 inline-block px-0.5 rounded select-text ${
+                                                  isWordActive
+                                                    ? 'bg-amber-500 text-black font-extrabold shadow-md shadow-amber-500/30 scale-105'
+                                                    : isActive
+                                                      ? 'hover:bg-white/10 text-white/95 underline decoration-white/10 hover:decoration-amber-500/50'
+                                                      : 'hover:bg-white/5 text-slate-300'
+                                                }`}
+                                                title={`Click to play from "${token.trim()}" (${formatTime(Math.floor(wordStart))})`}
+                                              >
+                                                {token}
+                                              </span>
+                                            );
+                                          });
+                                        })()}
+                                      </p>
+                                    </div>
+                                  </div>
+                                );
+                              });
+                            })()}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Right Column (4 cols): Scriptor AI Companion & Translation Station */}
+                  <div className="xl:col-span-4 bg-[#0F0F0F] border border-white/5 rounded-xl p-6 space-y-6 shadow-2xl">
+                    {/* Companion Header */}
+                    <div className="flex items-center justify-between border-b border-white/5 pb-4">
+                      <div className="flex items-center gap-3">
+                        <div className="bg-amber-500/10 p-2 rounded text-amber-500 border border-amber-500/20">
+                          <Sparkles className="w-4 h-4 animate-pulse" />
+                        </div>
+                        <div>
+                          <span className="font-serif text-sm font-semibold text-white tracking-wide uppercase block">AI Scriptor Companion</span>
+                          <span className="text-[9px] text-emerald-400 flex items-center gap-1 font-mono uppercase tracking-widest mt-0.5">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                            <span>Copilot Active</span>
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Navigation tabs inside grid sidebar */}
+                    <div className="flex border-b border-white/5 bg-[#0A0A0A]/30 p-1 shrink-0 overflow-x-auto scrollbar-none rounded gap-1">
+                      {[
+                        { id: 'summary', label: 'Summary', icon: FileText },
+                        { id: 'actions', label: 'Actions', icon: CheckSquare },
+                        { id: 'translate', label: 'Translate', icon: Languages },
+                        { id: 'writer', label: 'Writer', icon: PenTool },
+                        { id: 'chat', label: 'Ask AI', icon: MessageSquare }
+                      ].map((tb) => {
+                        const Icon = tb.icon;
+                        return (
+                          <button
+                            key={tb.id}
+                            onClick={() => {
+                              setActiveTab(tb.id as any);
+                              if (tb.id === 'summary') {
+                                handleAIAction('summarize');
+                              } else if (tb.id === 'actions') {
+                                handleAIAction('action-items');
+                              }
+                            }}
+                            className={`flex-1 min-w-[55px] py-2 text-[9px] uppercase tracking-wider font-bold rounded transition-all cursor-pointer ${
+                              activeTab === tb.id ? 'bg-[#151515] text-amber-500' : 'text-slate-500 hover:text-slate-300'
+                            }`}
+                          >
+                            <span className="block text-center">{tb.label}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Active Content Panel */}
+                    <div className="space-y-4">
+                      {/* 1. Summary & Action Items Tab */}
+                      {(activeTab === 'summary' || activeTab === 'actions') && (
+                        <div className="space-y-4">
+                          <div className="p-3 bg-amber-500/[0.02] border border-amber-500/10 rounded text-slate-400 text-xs leading-relaxed font-sans">
+                            {activeTab === 'summary' 
+                              ? 'High-fidelity executive summary identifying key milestones and speech themes.' 
+                              : 'Automatically extracted meeting actions, tasks, and responsibilities.'}
+                          </div>
+
+                          {isAiProcessing ? (
+                            <div className="flex flex-col items-center justify-center p-8 space-y-3">
+                              <Loader2 className="w-6 h-6 text-amber-500 animate-spin" />
+                              <span className="text-[10px] text-slate-500 font-mono uppercase tracking-widest">Running AI presets...</span>
+                            </div>
+                          ) : aiActionResult ? (
+                            <div className="prose prose-invert max-w-none text-xs bg-[#121212] p-4 rounded border border-white/5 shadow-inner leading-relaxed text-slate-300 whitespace-pre-wrap font-sans">
+                              {aiActionResult}
+                            </div>
+                          ) : (
+                            <div className="text-center py-12 text-slate-600 text-xs italic">
+                              Analyzing...
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* 2. Translation Station Tab */}
+                      {activeTab === 'translate' && (
+                        <div className="space-y-4">
+                          <div className="bg-[#121212] p-4 rounded border border-white/5 space-y-3">
+                            <span className="text-[10px] font-mono text-slate-400 uppercase tracking-widest block">Choose Target Language</span>
+                            <select
+                              value={selectedLanguageForTranslation}
+                              onChange={(e) => setSelectedLanguageForTranslation(e.target.value)}
+                              className="w-full bg-[#181818] text-white text-xs font-mono border border-white/10 rounded p-2 focus:outline-none"
+                            >
+                              <option value="Malayalam">Malayalam (മലയാളം)</option>
+                              <option value="Hindi">Hindi (हिन्दी)</option>
+                              <option value="Tamil">Tamil (தமிழ்)</option>
+                              <option value="Arabic">Arabic (العربية)</option>
+                              <option value="Spanish">Spanish (Español)</option>
+                              <option value="Japanese">Japanese (日本語)</option>
+                              <option value="French">French (Français)</option>
+                              <option value="German">German (Deutsch)</option>
+                              <option value="Chinese">Chinese (中文)</option>
+                            </select>
+                            <button
+                              onClick={() => handleAIAction('translate')}
+                              disabled={isAiProcessing}
+                              className="w-full py-2 bg-amber-500 hover:bg-amber-400 text-black font-sans font-bold text-xs uppercase tracking-widest rounded flex items-center justify-center gap-1.5 transition-all shadow-md cursor-pointer"
+                            >
+                              {isAiProcessing ? <Loader2 className="w-3.5 h-3.5 animate-spin text-black" /> : <Languages className="w-3.5 h-3.5" />}
+                              <span>Translate Full Dialogue</span>
+                            </button>
+                          </div>
+
+                          {aiActionResult && (
+                            <div className="prose prose-invert max-w-none text-xs bg-[#121212] p-4 rounded border border-white/5 shadow-inner leading-relaxed text-slate-300 whitespace-pre-wrap font-sans">
+                              {aiActionResult}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* 3. AI Writer / Creative Co-Pilot Tab */}
+                      {activeTab === 'writer' && (
+                        <div className="space-y-4">
+                          <div className="bg-[#121212] p-4 rounded border border-white/5 space-y-3">
+                            <span className="text-[10px] font-mono text-slate-400 uppercase tracking-widest block">Scriptor AI Writer</span>
+                            
+                            <div className="space-y-1">
+                              <label className="text-[9px] text-slate-500 uppercase font-mono tracking-wider block">Content Type</label>
+                              <select
+                                value={creativeType}
+                                onChange={(e) => setCreativeType(e.target.value)}
+                                className="w-full bg-[#181818] text-white text-xs font-mono border border-white/10 rounded p-2 focus:outline-none"
+                              >
+                                <option value="Story">Fictional Narrative / Story</option>
+                                <option value="Script">Dialogue Script / Screenplay</option>
+                                <option value="Speech">Motivational Speech</option>
+                                <option value="Blog">Professional Blog Post</option>
+                                <option value="Other">Custom Purpose</option>
+                              </select>
+                            </div>
+
+                            {activeTranscript && (
+                              <div className="flex items-center gap-2 py-1 select-none">
+                                <input
+                                  type="checkbox"
+                                  id="useTranscriptForCreative"
+                                  checked={useTranscriptForCreative}
+                                  onChange={(e) => setUseTranscriptForCreative(e.target.checked)}
+                                  className="accent-amber-500 rounded bg-[#181818] border-white/10 cursor-pointer"
+                                />
+                                <label htmlFor="useTranscriptForCreative" className="text-[10px] text-slate-400 font-sans cursor-pointer">
+                                  Reference active transcript facts
+                                </label>
+                              </div>
+                            )}
+
+                            <div className="space-y-1">
+                              <label className="text-[9px] text-slate-500 uppercase font-mono tracking-wider block">Co-Writer Focus & Outline</label>
+                              <textarea
+                                rows={4}
+                                value={creativePrompt}
+                                onChange={(e) => setCreativePrompt(e.target.value)}
+                                placeholder="Provide outline directions, style guide, or character profiles. E.g., 'Draft a classic sci-fi script about a time machine failure'..."
+                                className="w-full bg-[#181818] border border-white/10 rounded p-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-amber-500/30 font-sans leading-relaxed resize-none"
+                              />
+                            </div>
+
+                            <button
+                              onClick={handleCreateCreative}
+                              disabled={isGeneratingCreative}
+                              className="w-full py-2 bg-amber-500 hover:bg-amber-400 text-black font-sans font-bold text-xs uppercase tracking-widest rounded flex items-center justify-center gap-1.5 transition-all shadow-md cursor-pointer"
+                            >
+                              {isGeneratingCreative ? <Loader2 className="w-3.5 h-3.5 animate-spin text-black" /> : <Sparkles className="w-3.5 h-3.5 text-black" />}
+                              <span>Draft Masterpiece</span>
+                            </button>
+                          </div>
+
+                          {creativeResult && (
+                            <div className="space-y-2.5">
+                              <div className="flex justify-between items-center px-1">
+                                <span className="text-[9px] font-mono text-slate-500 uppercase tracking-widest">Masterpiece Draft</span>
+                                <div className="flex gap-1.5">
+                                  <button
+                                    onClick={() => {
+                                      navigator.clipboard.writeText(creativeResult);
+                                      showToast('Masterpiece copied!', 'success');
+                                    }}
+                                    className="px-2 py-0.5 bg-[#151515] border border-white/5 hover:border-white/10 rounded text-[9px] text-amber-500 font-mono uppercase tracking-wider cursor-pointer"
+                                    title="Copy to Clipboard"
+                                  >
+                                    Copy
+                                  </button>
+                                  <button
+                                    onClick={() => {
+                                      const blob = new Blob([creativeResult], { type: 'text/plain' });
+                                      const url = URL.createObjectURL(blob);
+                                      const a = document.createElement('a');
+                                      a.href = url;
+                                      a.download = `Scriptor_Creative_${creativeType}_Draft.txt`;
+                                      a.click();
+                                      URL.revokeObjectURL(url);
+                                      showToast('Masterpiece downloaded!', 'success');
+                                    }}
+                                    className="px-2 py-0.5 bg-[#151515] border border-white/5 hover:border-white/10 rounded text-[9px] text-amber-500 font-mono uppercase tracking-wider cursor-pointer"
+                                    title="Download manuscript"
+                                  >
+                                    Download
+                                  </button>
+                                </div>
+                              </div>
+                              <div className="prose prose-invert max-w-none text-xs bg-[#121212] p-4 rounded border border-white/5 shadow-inner leading-relaxed text-slate-300 whitespace-pre-wrap max-h-96 overflow-y-auto font-sans">
+                                {creativeResult}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* 4. DocAssist Conversational AI Assistant Tab */}
+                      {activeTab === 'chat' && (
+                        <div className="flex flex-col h-full space-y-4">
+                          <div className="flex-1 space-y-4 overflow-y-auto pr-1">
+                            {chatMessages.map((msg) => (
+                              <div
+                                key={msg.id}
+                                className={`flex flex-col max-w-[85%] ${
+                                  msg.role === 'user' ? 'ml-auto items-end' : 'mr-auto items-start'
+                                }`}
+                              >
+                                <span className="text-[8px] text-slate-600 font-mono mb-1 px-1 uppercase">
+                                  {msg.role === 'user' ? 'Analyst' : 'Scriptor Assistant'}
+                                </span>
+                                <div className={`p-3.5 rounded border text-xs leading-relaxed whitespace-pre-wrap ${
+                                  msg.role === 'user' 
+                                    ? 'bg-amber-500/5 text-amber-100 border-amber-500/15 rounded-tr-none' 
+                                    : 'bg-[#151515] text-slate-300 border-white/5 rounded-tl-none'
+                                }`}>
+                                  {msg.content}
+                                </div>
+                              </div>
+                            ))}
+
+                            {isChatLoading && (
+                              <div className="flex flex-col items-start max-w-[80%] animate-pulse">
+                                <span className="text-[8px] text-slate-600 font-mono mb-1 px-1">Computing...</span>
+                                <div className="bg-[#151515] border border-white/5 rounded p-3 flex items-center gap-2">
+                                  <Loader2 className="w-3 h-3 text-amber-500 animate-spin" />
+                                  <span className="text-slate-500 text-[10px]">Analyzing audio context...</span>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Chat Input form */}
+                          <form onSubmit={handleSendChatMessage} className="flex gap-2 pt-2 border-t border-white/5">
+                            <input
+                              type="text"
+                              placeholder="Ask about active speech segments..."
+                              value={chatInput}
+                              onChange={(e) => setChatInput(e.target.value)}
+                              className="flex-1 bg-[#151515] border border-white/5 rounded px-3 py-2 text-xs text-white placeholder-slate-700 focus:outline-none focus:border-amber-500/40"
+                            />
+                            <button
+                              type="submit"
+                              className="p-2 bg-amber-500 hover:bg-amber-400 text-black rounded transition-colors"
+                            >
+                              <Send className="w-4 h-4 fill-current text-black" />
+                            </button>
+                          </form>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                </div>
+              </div>
+            )}
+
+            {/* 🧭 PROFESSIONAL SCROLLABLE FOOTER LINKAGE */}
+            <div className="pt-12 border-t border-white/5 flex flex-col md:flex-row items-center justify-between gap-6 mt-12 text-slate-600">
+              <div className="flex items-center gap-4 text-xs font-mono">
+                <span>Scriptor AI © 2026. Scribe the Spoken Word.</span>
+                <span className="text-white/5">|</span>
+                <button
+                  onClick={() => setActiveMainView('privacy')}
+                  className="hover:text-amber-500 transition-colors cursor-pointer"
+                >
+                  Privacy Policy & Data Sovereign Rules
+                </button>
+              </div>
+
+              <div className="flex items-center gap-4 text-xs font-mono">
+                <button
+                  onClick={() => setActiveMainView('feedback')}
+                  className="hover:text-amber-500 transition-colors text-amber-500/80 cursor-pointer flex items-center gap-1"
+                >
+                  <Mail className="w-3 h-3" />
+                  <span>Enquiry & Direct Support</span>
+                </button>
+                <span className="text-white/5">|</span>
+                <span className="text-[10px] uppercase">Owner: althafka944@gmail.com</span>
               </div>
             </div>
 
-          </div>
-        ) : (
-          <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#0A0A0A] text-center">
-            <VolumeX className="w-12 h-12 text-slate-700 mb-4 animate-pulse" />
-            <h3 className="text-lg font-serif text-white">No active transcription</h3>
-            <p className="text-xs text-slate-500 mt-2 max-w-xs leading-relaxed">
-              Upload a meeting draft, record speaking intervals via microphone, or load a realistic onboarding demo to begin.
-            </p>
-            <button
-              onClick={() => {
-                setSavedTranscriptions(PRELOADED_DRAFTS);
-                setActiveId(PRELOADED_DRAFTS[0].id);
-              }}
-              className="mt-5 bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs uppercase tracking-widest py-2.5 px-5 rounded transition-all"
-            >
-              Load Demo Workspace
-            </button>
           </div>
         )}
-      </div>
-
-      {/* 🧭 RIGHT SIDEBAR: Scriptor AI Companion & Translation Station */}
-      <div id="chat-sidebar" className={`flex flex-col bg-[#0F0F0F] border-l border-white/5 h-full shadow-2xl transition-all duration-300 z-20 ${
-        isRightSidebarOpen ? 'w-96' : 'w-0 overflow-hidden'
-      }`}>
-        {/* Companion Header */}
-        <div className="h-20 border-b border-white/5 flex items-center justify-between px-6 bg-[#0F0F0F]">
-          <div className="flex items-center gap-3">
-            <div className="bg-amber-500/10 p-1.5 rounded text-amber-500 border border-amber-500/20">
-              <Sparkles className="w-4 h-4" />
-            </div>
-            <div>
-              <span className="font-serif text-sm text-white block tracking-wider uppercase">DocAssist Engine</span>
-              <span className="text-[10px] text-emerald-400 flex items-center gap-1 font-mono uppercase tracking-widest mt-0.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                <span>Copilot Active</span>
-              </span>
-            </div>
-          </div>
-          <button 
-            id="close-chat-btn"
-            onClick={() => setIsRightSidebarOpen(false)}
-            className="p-1.5 rounded hover:bg-white/5 text-slate-500 hover:text-white transition-colors"
-            title="Collapse Assistant"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        {/* Tab Controllers: Summary, Tasks, Translation, Chat */}
-        <div className="flex border-b border-white/5 bg-[#0A0A0A]/30 p-1">
-          <button
-            onClick={() => { setActiveTab('summary'); handleAIAction('summarize'); }}
-            className={`flex-1 py-2 text-[9px] uppercase tracking-wider font-bold rounded transition-all ${
-              activeTab === 'summary' ? 'bg-[#151515] text-amber-500' : 'text-slate-500 hover:text-slate-300'
-            }`}
-          >
-            Summary
-          </button>
-          <button
-            onClick={() => { setActiveTab('actions'); handleAIAction('action-items'); }}
-            className={`flex-1 py-2 text-[9px] uppercase tracking-wider font-bold rounded transition-all ${
-              activeTab === 'actions' ? 'bg-[#151515] text-amber-500' : 'text-slate-500 hover:text-slate-300'
-            }`}
-          >
-            Actions
-          </button>
-          <button
-            onClick={() => { setActiveTab('translate'); }}
-            className={`flex-1 py-2 text-[9px] uppercase tracking-wider font-bold rounded transition-all ${
-              activeTab === 'translate' ? 'bg-[#151515] text-amber-500' : 'text-slate-500 hover:text-slate-300'
-            }`}
-          >
-            Translate
-          </button>
-          <button
-            onClick={() => { setActiveTab('chat'); }}
-            className={`flex-1 py-2 text-[9px] uppercase tracking-wider font-bold rounded transition-all ${
-              activeTab === 'chat' ? 'bg-[#151515] text-amber-500' : 'text-slate-500 hover:text-slate-300'
-            }`}
-          >
-            Ask AI
-          </button>
-        </div>
-
-        {/* Active Content Panel */}
-        <div className="flex-1 overflow-y-auto p-5 bg-[#0A0A0A]/10">
-          
-          {/* 1. Summary & Action Items Tab */}
-          {(activeTab === 'summary' || activeTab === 'actions') && (
-            <div className="space-y-4">
-              {isAiProcessing ? (
-                <div className="flex flex-col items-center justify-center p-8 space-y-3">
-                  <Loader2 className="w-6 h-6 text-amber-500 animate-spin" />
-                  <span className="text-[10px] text-slate-500 font-mono uppercase tracking-widest">Running AI presets...</span>
-                </div>
-              ) : aiActionResult ? (
-                <div className="prose prose-invert max-w-none text-xs bg-[#121212] p-4 rounded border border-white/5 shadow-inner leading-relaxed text-slate-300 whitespace-pre-wrap">
-                  {aiActionResult}
-                </div>
-              ) : (
-                <div className="text-center py-12 text-slate-600 text-xs italic">
-                  Select a preset tab or click below to trigger high-fidelity model analysis.
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* 2. Translation Station Tab */}
-          {activeTab === 'translate' && (
-            <div className="space-y-4">
-              <div className="bg-[#121212] p-4 rounded border border-white/5 space-y-3">
-                <span className="text-[10px] font-mono text-slate-400 uppercase tracking-widest block">Choose Target Language</span>
-                <select
-                  value={selectedLanguageForTranslation}
-                  onChange={(e) => setSelectedLanguageForTranslation(e.target.value)}
-                  className="w-full bg-[#181818] text-white text-xs font-mono border border-white/10 rounded p-2 focus:outline-none"
-                >
-                  <option value="Spanish">Spanish (Español)</option>
-                  <option value="Japanese">Japanese (日本語)</option>
-                  <option value="French">French (Français)</option>
-                  <option value="German">German (Deutsch)</option>
-                  <option value="Indonesian">Indonesian (Bahasa Indonesia)</option>
-                </select>
-                <button
-                  onClick={() => handleAIAction('translate')}
-                  disabled={isAiProcessing}
-                  className="w-full py-2 bg-amber-500 hover:bg-amber-400 text-black font-sans font-bold text-xs uppercase tracking-widest rounded flex items-center justify-center gap-1.5 transition-all shadow-md"
-                >
-                  {isAiProcessing ? <Loader2 className="w-3.5 h-3.5 animate-spin text-black" /> : <Languages className="w-3.5 h-3.5" />}
-                  <span>Translate Full Dialogue</span>
-                </button>
-              </div>
-
-              {aiActionResult && (
-                <div className="prose prose-invert max-w-none text-xs bg-[#121212] p-4 rounded border border-white/5 shadow-inner leading-relaxed text-slate-300 whitespace-pre-wrap">
-                  {aiActionResult}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* 3. DocAssist Conversational AI Assistant Tab */}
-          {activeTab === 'chat' && (
-            <div className="flex flex-col h-full space-y-4">
-              <div className="flex-1 space-y-4 overflow-y-auto pr-1">
-                {chatMessages.map((msg) => (
-                  <div
-                    key={msg.id}
-                    className={`flex flex-col max-w-[85%] ${
-                      msg.role === 'user' ? 'ml-auto items-end' : 'mr-auto items-start'
-                    }`}
-                  >
-                    <span className="text-[8px] text-slate-600 font-mono mb-1 px-1 uppercase">
-                      {msg.role === 'user' ? 'Analyst' : 'Scriptor Assistant'}
-                    </span>
-                    <div className={`p-3.5 rounded border text-xs leading-relaxed whitespace-pre-wrap ${
-                      msg.role === 'user' 
-                        ? 'bg-amber-500/5 text-amber-100 border-amber-500/15 rounded-tr-none' 
-                        : 'bg-[#151515] text-slate-300 border-white/5 rounded-tl-none'
-                    }`}>
-                      {msg.content}
-                    </div>
-                  </div>
-                ))}
-
-                {isChatLoading && (
-                  <div className="flex flex-col items-start max-w-[80%] animate-pulse">
-                    <span className="text-[8px] text-slate-600 font-mono mb-1 px-1">Computing...</span>
-                    <div className="bg-[#151515] border border-white/5 rounded p-3 flex items-center gap-2">
-                      <Loader2 className="w-3 h-3 text-amber-500 animate-spin" />
-                      <span className="text-slate-500 text-[10px]">Analyzing audio context...</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Chat Input form */}
-              <form onSubmit={handleSendChatMessage} className="flex gap-2 pt-2 border-t border-white/5">
-                <input
-                  type="text"
-                  placeholder="Ask about active speech segments..."
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  className="flex-1 bg-[#151515] border border-white/5 rounded px-3 py-2 text-xs text-white placeholder-slate-700 focus:outline-none focus:border-amber-500/40"
-                />
-                <button
-                  type="submit"
-                  className="p-2 bg-amber-500 hover:bg-amber-400 text-black rounded transition-colors"
-                >
-                  <Send className="w-4 h-4 fill-current" />
-                </button>
-              </form>
-            </div>
-          )}
-
-        </div>
-      </div>
+      </main>
 
     </div>
   );
@@ -2216,11 +2467,107 @@ export default function App() {
 
 // Simple parser helper
 function parseTimestampToSeconds(timestamp: string): number {
-  const parts = timestamp.split(':');
+  if (!timestamp) return 0;
+  const parts = timestamp.trim().split(':');
+  if (parts.length === 3) {
+    const hrs = parseInt(parts[0], 10) || 0;
+    const mins = parseInt(parts[1], 10) || 0;
+    const secs = parseInt(parts[2], 10) || 0;
+    return hrs * 3600 + mins * 60 + secs;
+  }
   if (parts.length === 2) {
     const mins = parseInt(parts[0], 10) || 0;
     const secs = parseInt(parts[1], 10) || 0;
     return mins * 60 + secs;
   }
-  return 0;
+  const parsed = parseFloat(timestamp);
+  return isNaN(parsed) ? 0 : parsed;
+}
+
+interface TimelineItem {
+  id: string;
+  timestamp: string;
+  seconds: number;
+  duration: number;
+  text: string;
+}
+
+function getTimelineItems(segments: TranscriptSegment[], durationStr?: string): TimelineItem[] {
+  if (!segments || segments.length === 0) return [];
+  const items: TimelineItem[] = [];
+
+  // Parse total duration of audio
+  const totalDuration = durationStr ? parseTimestampToSeconds(durationStr) : 60;
+
+  // Sort segments by their starting timestamp to prevent out-of-order issues
+  const sortedSegments = [...segments].sort((a, b) => {
+    return parseTimestampToSeconds(a.timestamp) - parseTimestampToSeconds(b.timestamp);
+  });
+
+  for (let i = 0; i < sortedSegments.length; i++) {
+    const seg = sortedSegments[i];
+    const segStart = parseTimestampToSeconds(seg.timestamp);
+
+    // Determine the end boundary of this segment
+    let segEnd = totalDuration;
+    if (i < sortedSegments.length - 1) {
+      const nextStart = parseTimestampToSeconds(sortedSegments[i + 1].timestamp);
+      if (nextStart > segStart) {
+        segEnd = nextStart;
+      }
+    }
+
+    // Ensure we have a reasonable duration window for the segment
+    let segDuration = segEnd - segStart;
+    if (segDuration <= 0) {
+      segDuration = 5; // fallback segment duration
+    }
+
+    const text = seg.text.trim();
+    if (!text) continue;
+
+    // Split the segment text into individual sentences
+    const sentenceRegex = /[^.!?]+(?:[.!?]+|$)/g;
+    const matches = text.match(sentenceRegex);
+    const sentences = matches ? matches.map(s => s.trim()).filter(s => s.length > 0) : [text];
+
+    if (sentences.length === 0) continue;
+
+    // Count words in each sentence to distribute time proportionally to speaking length
+    const sentenceStats = sentences.map(s => {
+      const words = s.split(/\s+/).filter(w => w.length > 0);
+      return {
+        text: s,
+        wordCount: Math.max(1, words.length)
+      };
+    });
+
+    const totalWords = sentenceStats.reduce((sum, s) => sum + s.wordCount, 0);
+
+    let currentOffset = 0;
+    sentenceStats.forEach((s, sIdx) => {
+      const proportion = s.wordCount / totalWords;
+      const sentenceDuration = segDuration * proportion;
+
+      // Calculate starting seconds of this sentence
+      const sentenceStart = segStart + currentOffset;
+
+      const mins = Math.floor(sentenceStart / 60);
+      const secs = Math.floor(sentenceStart % 60);
+      const timeStr = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+
+      items.push({
+        id: `${seg.id}-sentence-${sIdx}`,
+        timestamp: timeStr,
+        seconds: parseFloat(sentenceStart.toFixed(2)),
+        duration: parseFloat(sentenceDuration.toFixed(2)),
+        text: s.text
+      });
+
+      currentOffset += sentenceDuration;
+    });
+  }
+
+  // Sort timeline items chronologically
+  return items.sort((a, b) => a.seconds - b.seconds);
 }
