@@ -646,7 +646,7 @@ Use this transcript to answer questions, explain speaker statements, write notes
 // 🌐 SEO & Crawler Discovery Endpoints for Google Search
 app.get('/robots.txt', (req, res) => {
   res.type('text/plain');
-  res.send(`User-agent: *\nAllow: /\nSitemap: https://scriptor-ai.netlify.app/sitemap.xml`);
+  res.send(`User-agent: *\nAllow: /\nSitemap: https://scriptor-ai.onrender.com/sitemap.xml`);
 });
 
 app.get('/sitemap.xml', (req, res) => {
@@ -654,7 +654,7 @@ app.get('/sitemap.xml', (req, res) => {
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
-    <loc>https://scriptor-ai.netlify.app/</loc>
+    <loc>https://scriptor-ai.onrender.com/</loc>
     <lastmod>2026-07-15</lastmod>
     <changefreq>daily</changefreq>
     <priority>1.0</priority>

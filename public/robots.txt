@@ -1,3 +1,4 @@
 User-agent: *
 Allow: /
-Sitemap: https://scriptor-ai.netlify.app/sitemap.xml
+Sitemap: https://scriptor-ai.onrender.com/sitemap.xml
+
