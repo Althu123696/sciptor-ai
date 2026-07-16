@@ -17,6 +17,19 @@ const port = 3000;
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
 
+// Serve static files from public folder
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ✅ Add these routes before the SPA catch-all
+app.get('/privacy', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public/privacy.html'));
+});
+
+app.get('/terms', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public/terms.html'));
+});
+
+
 // Initialize Gemini client safely
 const apiKey = process.env.GEMINI_API_KEY;
 let ai: GoogleGenAI | null = null;
