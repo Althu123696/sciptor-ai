@@ -29,6 +29,10 @@ app.get('/terms', (req, res) => {
   res.sendFile(path.join(__dirname, 'public/terms.html'));
 });
 
+app.get('/contact', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public/contact.html'));
+});
+
 
 // Initialize Gemini client safely
 const apiKey = process.env.GEMINI_API_KEY;
