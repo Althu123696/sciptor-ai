@@ -27,6 +27,17 @@ app.use(express.static(path.join(__dirname, 'public'), {
   }
 }));
 
+// Explicit route for sitemap
+app.get('/sitemap_index.xml', (req, res) => {
+  res.type('application/xml');
+  res.sendFile(path.join(__dirname, 'public', 'sitemap_index.xml'));
+});
+
+// Explicit route for robots.txt (recommended)
+app.get('/robots.txt', (req, res) => {
+  res.type('text/plain');
+  res.sendFile(path.join(__dirname, 'public', 'robots.txt'));
+});
 
 // ✅ Add these routes before the SPA catch-all
 app.get('/privacy', (req, res) => {
@@ -719,21 +730,42 @@ Use this transcript to answer questions, explain speaker statements, write notes
 // 🌐 SEO & Crawler Discovery Endpoints for Google Search
 app.get('/robots.txt', (req, res) => {
   res.type('text/plain');
-  res.send(`User-agent: *\nAllow: /\nSitemap: https://scriptor-ai.onrender.com/sitemap.xml`);
+  res.send(`User-agent: *
+Allow: /
+Sitemap: https://scriptor-ai.onrender.com/sitemap_index.xml`);
 });
 
-app.get('/sitemap.xml', (req, res) => {
+app.get('/sitemap_index.xml', (req, res) => {
   res.type('application/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
-    <loc>https://scriptor-ai.onrender.com</loc>
+    <loc>https://scriptor-ai.onrender.com/</loc>
     <lastmod>2026-07-15</lastmod>
     <changefreq>daily</changefreq>
     <priority>1.0</priority>
   </url>
+  <url>
+    <loc>https://scriptor-ai.onrender.com/privacy</loc>
+    <lastmod>2026-07-15</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://scriptor-ai.onrender.com/terms</loc>
+    <lastmod>2026-07-15</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://scriptor-ai.onrender.com/contact</loc>
+    <lastmod>2026-07-15</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
 </urlset>`);
 });
+
 
 // Serve frontend assets
 if (process.env.NODE_ENV === 'production') {
