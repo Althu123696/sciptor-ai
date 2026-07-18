@@ -27,32 +27,6 @@ app.use(express.static(path.join(__dirname, 'public'), {
   }
 }));
 
-// Explicit route for sitemap
-app.get('/sitemap_index.xml', (req, res) => {
-  res.type('application/xml');
-  res.sendFile(path.join(__dirname, 'public', 'sitemap_index.xml'));
-});
-
-// Explicit route for robots.txt (recommended)
-app.get('/robots.txt', (req, res) => {
-  res.type('text/plain');
-  res.sendFile(path.join(__dirname, 'public', 'robots.txt'));
-});
-
-// ✅ Add these routes before the SPA catch-all
-app.get('/privacy', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public/privacy.html'));
-});
-
-app.get('/terms', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public/terms.html'));
-});
-
-app.get('/contact', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public/contact.html'));
-});
-
-
 // Initialize Gemini client safely
 const apiKey = process.env.GEMINI_API_KEY;
 let ai: GoogleGenAI | null = null;
