@@ -701,6 +701,13 @@ Use this transcript to answer questions, explain speaker statements, write notes
   }
 });
 
+// 🫀 Lightweight health check for uptime monitors (keep-alive pings)
+// Point external monitors (UptimeRobot, cron-job.org, etc.) at this instead of "/"
+// so pings stay fast and don't hit the SPA/static file serving.
+app.get('/healthz', (req, res) => {
+  res.status(200).type('text/plain').send('ok');
+});
+
 // 🌐 SEO & Crawler Discovery Endpoints for Google Search
 app.get('/robots.txt', (req, res) => {
   res.type('text/plain');
